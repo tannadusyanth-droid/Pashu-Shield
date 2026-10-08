@@ -1,0 +1,5437 @@
+import os
+import env_file  # noqa: F401  (loads .env before anything reads the environment)
+import json
+import hmac
+import math
+import uuid
+import jwt
+import sqlite3
+import requests
+import io
+import base64
+import secrets
+import logging
+import time
+from datetime import datetime, timedelta, date
+
+def _flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+from functools import wraps
+from ipaddress import ip_address
+from urllib.parse import urlsplit
+from flask import Flask, request, jsonify, g, send_from_directory, Response
+from PIL import Image
+import cv2
+import numpy as np
+import qrcode
+from sklearn.cluster import DBSCAN
+
+from database import (
+    get_db, init_db, hash_password, verify_password, next_code,
+    audit_log, calculate_expected_delivery, DB_PATH,
+    find_user_by_mobile, otp_only_credentials,
+)
+from case_service import create_case_record
+from ivr_config import LANGUAGE_NAMES, SUPPORTED_LANGUAGES, get_ivr_settings
+from ivr_security import ivr_webhook_required, shared_rate_limit_ok
+from ivr_service import (
+    apply_call_input, call_response, finalize_report, get_call_for_user,
+    handle_call_event, helpline_analytics, list_reports_for_user,
+    list_vet_availability, set_vet_availability, start_inbound_call,
+)
+import weather
+import animal_ai
+import sms_gateway
+import demo_auth
+import clerk_auth
+from otp_service import (
+    OtpError, otp_login_available, otp_login_status,
+    diagnostics as otp_diagnostics,
+    public_settings as otp_public_settings,
+    request_otp as request_farmer_otp, resend_otp as resend_farmer_otp,
+    registration_token_ttl_seconds,
+    consume_registration_token,
+    issue_external_registration_token,
+    verify_otp as verify_farmer_otp,
+)
+from sms_service import send_sms, send_sms_urgent, get_sent_log, get_dead_letters, get_worker_stats, get_sms_provider_info
+from push_service import is_push_configured, get_public_key, push_notification
+from disease_knowledge import DiseaseKnowledge
+import turn_config
+import webcalling
+import captcha_service  # noqa: E402  (CAPTCHA hook GA-21, env-driven, no secrets)
+from realtime import (
+    allowed_origins,
+    emit_call_event,
+    emit_to_user,
+    init_realtime,
+    origin_allowed,
+    origin_diagnostics,
+    signaling_configured,
+    signaling_endpoint,
+    socket_public_url,
+    socket_public_url_source,
+    socketio,
+    socketio_path,
+    worker_configuration_safe,
+)
+
+SECRET_KEY = os.environ.get("SIH_SECRET_KEY") or secrets.token_urlsafe(48)
+if not os.environ.get("SIH_SECRET_KEY"):
+    logging.getLogger(__name__).warning(
+        "SIH_SECRET_KEY is not configured; generated an ephemeral development key."
+    )
+TOKEN_EXP_HOURS = 12
+
+FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend")
+PORT = int(os.environ.get("PORT", "5001"))
+
+app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path="")
+# Validate the fixed helpline/provider configuration during process startup.
+get_ivr_settings()
+# Safe under multiple Gunicorn workers: database.init_db uses an inter-process
+# lock and additive/idempotent migrations.
+init_db()
+clerk_auth.warm_up()
+# Loud, secret-free warning when the prototype demo farmer login is switched
+# on. Off by default; see DEMO_ACCOUNT.md before enabling it anywhere public.
+demo_auth.log_demo_mode_banner()
+
+CASE_STATUSES = [
+    "NEW", "ASSIGNED", "UNDER INVESTIGATION", "SAMPLE COLLECTED", "LAB PENDING",
+    "DIAGNOSED", "TREATMENT", "FOLLOW-UP", "RECOVERED", "CLOSED"
+]
+
+SAMPLE_STATUSES = [
+    "COLLECTED", "READY_FOR_PICKUP", "PICKED_UP", "IN_TRANSIT",
+    "ARRIVED_AT_LAB", "LAB_RECEIVED", "TESTING", "RESULT_READY",
+    "COMPLETED", "REJECTED"
+]
+
+ALLERGY_MED_CLASSES = {
+    "penicillin": ["penicillin", "amoxicillin", "ampicillin", "pen-strep", "cloxacillin", "amoxiclav", "beta-lactam"],
+    "sulfa": ["sulphonamide", "sulfamethoxazole", "trimethoprim", "co-trimoxazole", "cotrimoxazole", "sulfadiazine"],
+    "tetracycline": ["tetracycline", "oxytetracycline", "chlortetracycline", "doxycycline"],
+    "nsaid": ["meloxicam", "flunixin", "ketoprofen", "phenylbutazone", "carprofen", "diclofenac", "aspirin", "paracetamol"],
+    "aminoglycoside": ["gentamicin", "streptomycin", "neomycin", "amikacin"],
+    "fluoroquinolone": ["enrofloxacin", "ciprofloxacin", "marbofloxacin", "levofloxacin"],
+}
+
+
+# ---------------------------------------------------------------- helpers --
+def make_token(user):
+    payload = {
+        "uid": user["id"],
+        "role": user["role"],
+        "name": user["full_name"],
+        "exp": datetime.utcnow() + timedelta(hours=TOKEN_EXP_HOURS),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+
+
+def decode_token(token):
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+    except Exception:
+        return None
+
+
+def auth_required(roles=None):
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            auth = request.headers.get("Authorization", "")
+            if not auth.startswith("Bearer "):
+                return jsonify({"error": "Missing or invalid Authorization header"}), 401
+            payload = decode_token(auth.split(" ", 1)[1])
+            if not payload:
+                return jsonify({"error": "Invalid or expired token"}), 401
+            if roles and payload["role"] not in roles:
+                return jsonify({"error": "Forbidden for this role"}), 403
+            g.user = payload
+            return fn(*args, **kwargs)
+        return wrapper
+    return deco
+
+
+def row_to_dict(row):
+    return dict(row) if row else None
+
+
+# ------------------------------------- real-time web calling (signaling) ---
+# Flask-SocketIO is wired into this same WSGI application, so the REST API and
+# the signaling channel share one authentication scheme (the JWT above), one
+# SQLite database and one deployment. ``realtime`` never imports ``app``, so
+# there is no circular import: it receives the token decoder and DB factory.
+init_realtime(app, decode_token=decode_token, get_db=get_db)
+
+
+# ------------------------------------------------------------------
+# Multilingual notification templates (Req 4)
+# ------------------------------------------------------------------
+_NOTIFICATION_TEMPLATES = {
+    "new_case": {
+        "en": "New case reported: {case_no} for animal {animal_code}.",
+        "hi": "नया मामला दर्ज: {animal_code} के लिए {case_no}।",
+        "mr": "नवीन प्रकरण नोंदवले: {case_no} पशू {animal_code} साठी.",
+        "te": "కొత్త కేసు నమోదు: {case_no} జంతువు {animal_code} కోసం.",
+    },
+    "case_update": {
+        "en": "Case {case_no} updated: {status}.",
+        "hi": "मामला {case_no} अपडेट: {status}।",
+        "mr": "प्रकरण {case_no} अद्ययावत: {status}.",
+        "te": "కేసు {case_no} నవీకరణ: {status}.",
+    },
+    "lab_report_ready": {
+        "en": "Lab report {report_no} is ready for case {case_no}.",
+        "hi": "लैब रिपोर्ट {report_no} मामले {case_no} के लिए तैयार है।",
+        "mr": "प्रयोगशाळा अहवाल {report_no} प्रकरण {case_no} साठी तयार आहे.",
+        "te": "ల్యాబ్ రిపోర్ట్ {report_no} కేసు {case_no} కోసం సిద్ధంగా ఉంది.",
+    },
+    "prescription_issued": {
+        "en": "An e-prescription is available for case {case_no}.",
+        "hi": "मामले {case_no} के लिए ई-प्रिस्क्रिप्शन उपलब्ध है।",
+        "mr": "प्रकरण {case_no} साठी ई-प्रिस्क्रिप्शन उपलब्ध आहे.",
+        "te": "కేసు {case_no} కోసం ఇ-ప్రిస్క్రిప్షన్ అందుబాటులో ఉంది.",
+    },
+    "vaccination_due": {
+        "en": "Vaccination due for your animal {animal_code}. Please schedule a visit.",
+        "hi": "आपके पशु {animal_code} के लिए टीकाकरण बकाया है। कृपया विज़िट शेड्यूल करें।",
+        "mr": "तुमच्या पशूचे {animal_code} लसीकरण बाकी आहे. कृपया भेटीची व्यवस्था करा.",
+        "te": "మీ జంతువు {animal_code} కోసం వ్యాక్సినేషన్ బాకీ ఉంది.",
+    },
+    "farm_alert": {
+        "en": "Farm alert: {disease} detected in your area ({district}). {action}",
+        "hi": "फार्म अलर्ट: आपके क्षेत्र ({district}) में {disease} का पता चला। {action}",
+        "mr": "शेत सूचना: तुमच्या भागात ({district}) {disease} आढळला. {action}",
+        "te": "ఫార్మ్ హెచ్చరిక: మీ ప్రాంతంలో ({district}) {disease} కనుగొనబడింది. {action}",
+    },
+    "auto_escalation": {
+        "en": "URGENT: Case {case_no} auto-escalated to Critical by AI triage. Disease risk: {disease}.",
+        "hi": "अत्यावश्यक: मामला {case_no} AI ट्राइएज द्वारा गंभीर के रूप में स्वतः बढ़ाया गया।",
+        "mr": "अत्यंत आवश्यक: प्रकरण {case_no} AI ट्रायजद्वारे गंभीर म्हणून आपोआप वाढवले.",
+        "te": "అత్యవసరం: కేసు {case_no} AI ట్రయాజ్ ద్వారా స్వయంచాలకంగా క్లిష్టంగా పెంచబడింది.",
+    },
+}
+
+
+def _translate(template_key: str, language: str | None, **kwargs) -> str:
+    """Return translated notification text using the template system."""
+    lang = (language or "en").strip().lower()
+    templates = _NOTIFICATION_TEMPLATES.get(template_key, {})
+    text = templates.get(lang) or templates.get("en") or template_key
+    try:
+        return text.format(**kwargs)
+    except (KeyError, IndexError):
+        return text
+
+
+def notify(conn, user_id, message, type_="info", language=None, template_key=None, **kwargs):
+    """Create an in-app notification, optionally translated and sent via SMS/Push."""
+    if template_key:
+        # Look up user's preferred language
+        if not language:
+            user_row = conn.execute("SELECT preferred_language, sms_enabled, mobile FROM users WHERE id=?", (user_id,)).fetchone()
+            if user_row:
+                language = user_row["preferred_language"] or "en"
+                sms_enabled = user_row["sms_enabled"]
+                user_mobile = user_row["mobile"]
+            else:
+                language = language or "en"
+                sms_enabled = 0
+                user_mobile = None
+        else:
+            user_row = conn.execute("SELECT sms_enabled, mobile FROM users WHERE id=?", (user_id,)).fetchone()
+            sms_enabled = user_row["sms_enabled"] if user_row else 0
+            user_mobile = user_row["mobile"] if user_row else None
+        message = _translate(template_key, language, **kwargs)
+    else:
+        sms_enabled = 0
+        user_mobile = None
+
+    conn.execute("INSERT INTO notifications (user_id, message, type) VALUES (?,?,?)", (user_id, message, type_))
+
+    # SMS dispatch for critical alerts when enabled (Req 8)
+    # Real-time: send_sms is non-blocking (background thread)
+    if sms_enabled and user_mobile and type_ in ("case", "lab", "prescription", "farm_alert"):
+        try:
+            from ivr_config import normalize_indian_number
+            e164 = normalize_indian_number(user_mobile)
+            if e164:
+                if type_ == "farm_alert":
+                    send_sms_urgent(e164, message)  # Critical: outbreak alert
+                else:
+                    send_sms(e164, message)          # Standard priority
+        except Exception:
+            pass  # Never block notification on SMS failure
+
+
+def case_json(conn, row):
+    d = dict(row)
+    animal = conn.execute("SELECT * FROM animals WHERE id=?", (d["animal_id"],)).fetchone()
+    herd = conn.execute("SELECT * FROM herds WHERE id=?", (d["herd_id"],)).fetchone() if d["herd_id"] else None
+    owner = conn.execute("SELECT full_name, mobile FROM users WHERE id=?", (d["owner_id"],)).fetchone()
+    vet = conn.execute("SELECT full_name FROM users WHERE id=?", (d["vet_id"],)).fetchone() if d["vet_id"] else None
+    d["animal"] = row_to_dict(animal)
+    d["herd"] = row_to_dict(herd)
+    d["owner"] = row_to_dict(owner)
+    d["vet_name"] = vet["full_name"] if vet else None
+    helpline = conn.execute(
+        "SELECT report_no, call_id, language, district, village, location_source, urgency, source, status, duplicate_of, structured_summary "
+        "FROM helpline_reports WHERE case_id=? ORDER BY id DESC LIMIT 1",
+        (d["id"],),
+    ).fetchone()
+    if helpline:
+        d["helpline_report"] = row_to_dict(helpline)
+        d["helpline_report"]["structured_summary"] = json.loads(
+            d["helpline_report"]["structured_summary"] or "{}"
+        )
+    else:
+        d["helpline_report"] = None
+    return d
+
+
+def public_user(row):
+    d = dict(row)
+    d.pop("password_hash", None)
+    d.pop("salt", None)
+    return d
+
+
+def make_qr_image_data_url(payload: str) -> str:
+    """Generate high-contrast PNG QR Code as a base64 data-URL."""
+    qr = qrcode.QRCode(version=1, box_size=8, border=2)
+    qr.add_data(payload)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{b64}"
+
+
+def decode_qr_image(img_bytes_or_base64: str) -> str:
+    """Decode QR code image using OpenCV QRCodeDetector."""
+    try:
+        raw_b64 = img_bytes_or_base64
+        if "," in raw_b64:
+            raw_b64 = raw_b64.split(",", 1)[1]
+        img_bytes = base64.b64decode(raw_b64)
+        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        np_img = np.array(pil_img)
+        detector = cv2.QRCodeDetector()
+        val, pts, _ = detector.detectAndDecode(np_img)
+        return (val or "").strip()
+    except Exception:
+        return ""
+
+
+def check_allergy_conflict(medicine_name: str, active_allergies: list) -> dict | None:
+    """Check if the prescribed medication matches any documented animal allergy."""
+    if not medicine_name or not active_allergies:
+        return None
+    med_clean = medicine_name.strip().lower()
+    for allergy in active_allergies:
+        allergen = (allergy.get("allergen") or "").strip().lower()
+        if not allergen:
+            continue
+        # Direct match or substring match
+        if allergen in med_clean or med_clean in allergen:
+            return allergy
+        # Class match
+        for cls_name, drugs in ALLERGY_MED_CLASSES.items():
+            allergen_in_class = cls_name in allergen or any(d in allergen for d in drugs)
+            med_in_class = cls_name in med_clean or any(d in med_clean for d in drugs)
+            if allergen_in_class and med_in_class:
+                return allergy
+    return None
+
+
+# -------------------------------------------------------------- frontend --
+@app.after_request
+def no_cache_static(resp):
+    if request.path in ("/", "/index.html") or request.path.endswith((".js", ".css")):
+        resp.headers["Cache-Control"] = "no-store, must-revalidate"
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("Permissions-Policy", "microphone=(self), camera=(self), geolocation=(self)")
+    return resp
+
+
+@app.route("/")
+def index():
+    return send_from_directory(FRONTEND_DIR, "index.html")
+
+
+@app.get("/api/health")
+def health():
+    try:
+        conn = get_db()
+        conn.execute("SELECT 1").fetchone()
+        conn.close()
+        database_ok = True
+    except sqlite3.Error:
+        database_ok = False
+    gateway = sms_gateway.gateway_public_info()
+    otp_status = otp_login_status()
+    # One snapshot: the three TURN fields below must never disagree with each
+    # other, and describe() is secret-free by construction.
+    ice = turn_config.describe()
+    return jsonify({
+        "status": "ok" if database_ok else "degraded",
+        "service": "pashu-shield-backend",
+        "database": "ok" if database_ok else "unavailable",
+        "provider_mode": get_ivr_settings().provider_mode,
+        # Secret-free SMS gateway status (no credentials, no endpoint URL).
+        "sms_gateway": {
+            "mode": gateway["mode"],
+            "configured": gateway["configured"],
+            "usable": gateway["usable"],
+            # Documented multi-device behaviour: unpinned ⇒ random device.
+            "device_pinned": gateway["device_pinned"],
+        },
+        "auth": {
+            # Role-specific authentication (restored): farmers are OTP-only,
+            # Vet / Govt / Lab keep the original password login on /api/auth/login.
+            "farmer": {"login": "mobile_otp", "signup": "mobile_otp", "password_login": False},
+            "staff_login_method": "password",
+            "staff_self_register_roles": list(SELF_REGISTER_ROLES),
+        },
+        "farmer_otp_login": {
+            "enabled": otp_login_available(),
+            "password_login_enabled": False,
+            "signup_enabled": True,
+            # Secret-free readiness flags: an unstable pepper (or a database
+            # outside the persistent disk) silently breaks OTP verification.
+            "pepper_stable": otp_status["pepper_stable"],
+            "blockers": otp_status["blockers"],
+            "database_path_configured": bool((os.environ.get("SIH_DB_PATH") or "").strip()),
+            "persistent_mount_configured": bool(
+                (os.environ.get("SIH_DB_PATH") or "").strip()
+                and (not os.environ.get("RENDER") or DB_PATH.startswith("/var/data"))
+            ),
+        },
+        # Prototype demo account state — flags only, never the number and never
+        # the code. A visible "enabled": true here is the signal to turn it off.
+        "demo_mode": demo_auth.demo_mode_status(),
+        # Real-time web calling (in-app WebRTC audio). Secret-free: no TURN
+        # credential and no signaling payload is ever reported here.
+        "web_calling": {
+            "channel": "webrtc_web_call",
+            "signaling": "flask-socketio",
+            "signaling_configured": signaling_configured(),
+            # Secret-free signaling address diagnostics: the exact public base
+            # URL and path a browser must use (empty URL = same origin). Both
+            # are already public by design — the browser is told the same values
+            # by /api/webcall/config — and this is what makes a misconfigured
+            # SIH_PUBLIC_BACKEND_URL or SIH_SOCKETIO_PATH visible from outside.
+            "signaling_url": socket_public_url(),
+            # Where the signaling URL came from (SIH_PUBLIC_BACKEND_URL,
+            # RENDER_EXTERNAL_URL, or "none" = same origin). Secret-free, and
+            # the quickest way to see that a split deployment resolved its
+            # backend address automatically.
+            "signaling_url_source": socket_public_url_source(),
+            # Full URL the browser opens: <signaling_url>/socket.io (empty when
+            # the deployment is same-origin).
+            "signaling_endpoint": signaling_endpoint(),
+            "socketio_path": socketio_path(),
+            # Browser origins allowed to open the signaling socket (the portal
+            # origins are public by design; nothing secret is exposed here).
+            "allowed_origins": allowed_origins(),
+            # Which origins came from the environment vs the built-in portal
+            # defaults — the difference between "the variable was never
+            # updated" and "the browser is on an unexpected origin".
+            "allowed_origins_source": origin_diagnostics(),
+            "ring_timeout_seconds": webcalling.ring_timeout_seconds(),
+            "ring_timeout": webcalling.ring_timeout_seconds(),
+            "sweeper_enabled": os.environ.get("SIH_WEBCALL_SWEEPER", "true").strip().lower() not in {"0", "false", "no", "off"},
+            "push_configured": is_push_configured(),
+            "redis_message_queue": bool((os.environ.get("SIH_REDIS_URL") or "").strip()),
+            "worker_configuration_safe": worker_configuration_safe(),
+            "turn_configured": ice["turn_configured"],
+            "turn_mode": ice["turn_mode"],
+            "turn_url_count": ice["turn_url_count"],
+            # Secret-free diagnosis: the *name* of the variable that is missing
+            # or empty (turn_config_issue / turn_env), never a value.
+            "turn_config_issue": ice["turn_config_issue"],
+            "ice": ice,
+        },
+    }), 200 if database_ok else 503
+
+
+@app.get("/api/ivr/info")
+def ivr_info():
+    settings = get_ivr_settings()
+    return jsonify({
+        "helpline_number": settings.phone_number,
+        "helpline_e164": settings.helpline_e164,
+        "display_number": settings.display_number,
+        "tel_uri": settings.tel_uri,
+        "provider_mode": settings.provider_mode,
+        "pstn_connected": settings.pstn_connected,
+        "supported_languages": [
+            {"code": code, "name": LANGUAGE_NAMES[code]} for code in SUPPORTED_LANGUAGES
+        ],
+    })
+
+
+# ------------------------------------------------------------------ auth --
+# Role-specific authentication (restored):
+#   * Farmer / Animal Owner  -> mobile number + SMS OTP only. There is no
+#     password login and no password signup for farmers; both routes refuse it.
+#   * Veterinarian / Government / Laboratory -> the original email-or-mobile +
+#     password login and signup, unchanged.
+# The role always comes from the database row, never from the request body, and
+# the JWT is minted from that row (see make_token).
+SELF_REGISTER_ROLES = ("vet", "govt", "lab")   # password signup (original flow)
+FARMER_ROLE = "owner"
+
+
+@app.post("/api/auth/register")
+@captcha_service.captcha_required(action="register")
+def register():
+    data = request.get_json(force=True) or {}
+    requested_role = str(data.get("role") or "").strip().lower()
+    if requested_role == FARMER_ROLE:
+        # Farmers create their profile with a phone-verified OTP flow; the
+        # password endpoint must never create or authenticate a farmer.
+        return jsonify({
+            "error": ("Farmers create their profile with a mobile number and OTP. "
+                      "Use /api/auth/farmer/request-otp and /api/auth/farmer/register."),
+            "code": "FARMER_OTP_SIGNUP_REQUIRED",
+        }), 403
+    required = ["full_name", "mobile", "email", "password", "confirm_password", "role"]
+    missing = [f for f in required if not data.get(f)]
+    if missing:
+        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+    if data["password"] != data["confirm_password"]:
+        return jsonify({"error": "Passwords do not match"}), 400
+    if len(data["password"]) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    if data["role"] not in SELF_REGISTER_ROLES:
+        # ``owner`` already returned 403 above; anything else is not a role.
+        return jsonify({"error": "Invalid role"}), 400
+    preferred_language = (data.get("preferred_language") or "").strip().lower() or None
+    if preferred_language and preferred_language not in SUPPORTED_LANGUAGES:
+        return jsonify({"error": "Preferred language must be en, te, hi, or mr"}), 400
+    # Systematic validation GA-1-5 (additive, after original 400 paths)
+    v_errors = validation_service.validate_user_register(data)
+    if v_errors:
+        # Filter out owner role check which is handled separately with specific code
+        # Keep validation errors for other fields (XSS, mobile format, email format, etc.)
+        # But ignore errors that would duplicate original 400 checks (password length/mismatch, role)
+        filtered = [e for e in v_errors if e["field"] not in ("password", "confirm_password", "role") or "invalid characters" in e["message"].lower()]
+        # Also ignore mobile/email required because missing already handled
+        filtered = [e for e in filtered if not (e["field"] in ("mobile", "email", "full_name") and "required" in e["message"].lower() and e["field"] not in data)]
+        if filtered:
+            # If only role error remains, let original 400 handle; otherwise 422
+            if not (len(filtered) == 1 and filtered[0]["field"] == "role"):
+                # Check if any filtered error is XSS or format that should be 422
+                has_xss_or_format = any("invalid characters" in e["message"].lower() or "valid" in e["message"].lower() for e in filtered)
+                if has_xss_or_format:
+                    return jsonify({"error": "Validation failed", "fields": filtered, "code": "VALIDATION_FAILED"}), 422
+
+    conn = get_db()
+    try:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE email=? OR mobile=?", (data["email"], data["mobile"])
+        ).fetchone()
+        if existing:
+            return jsonify({"error": "An account with this email or mobile already exists"}), 409
+
+        pw_hash, salt = hash_password(data["password"])
+        cur = conn.execute(
+            "INSERT INTO users (full_name, mobile, email, password_hash, salt, role, specialization, preferred_language, village, block, district, state) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (data["full_name"], data["mobile"], data["email"], pw_hash, salt, data["role"],
+             data.get("specialization"), preferred_language, data.get("village"), data.get("block"),
+             data.get("district"), data.get("state", "Maharashtra")),
+        )
+        user_id = cur.lastrowid
+        audit_log(conn, "REGISTER_USER", "user", user_id, actor_id=user_id,
+                  actor_name=data["full_name"], actor_role=data["role"],
+                  details={"email": data["email"], "role": data["role"]})
+        conn.commit()
+        user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        token = make_token(user)
+        return jsonify({"token": token, "user": public_user(user)}), 201
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "An account with this email or mobile already exists"}), 409
+    finally:
+        conn.close()
+
+
+@app.post("/api/auth/login")
+@captcha_service.captcha_required(action="login")
+def login():
+    data = request.get_json(force=True) or {}
+    identifier = data.get("identifier") or data.get("email") or data.get("mobile")
+    password = data.get("password")
+    if not identifier or not password:
+        return jsonify({"error": "Email/mobile and password are required"}), 400
+    v_errors = validation_service.validate_login(data)
+    if v_errors:
+        # Filter missing-field errors which already handled as 400; only return 422 for XSS etc.
+        # For backward compat with existing tests, treat identifier/password required as 400
+        has_required = any(e["field"] in ("identifier", "password") and "required" in e["message"].lower() for e in v_errors)
+        if has_required:
+            return jsonify({"error": "Email/mobile and password are required"}), 400
+        return jsonify({"error": "Validation failed", "fields": v_errors, "code": "VALIDATION_FAILED"}), 422
+
+    conn = get_db()
+    user = conn.execute(
+        "SELECT * FROM users WHERE email=? OR mobile=?", (identifier, identifier)
+    ).fetchone()
+    if not user or not verify_password(password, user["salt"], user["password_hash"]):
+        conn.close()
+        return jsonify({"error": "Invalid credentials"}), 401
+    # Check deactivation (GA-20)
+    try:
+        if user["account_status"] == "DEACTIVATED":
+            conn.close()
+            return jsonify({"error": "Account is deactivated. Contact support to re-activate.", "code": "ACCOUNT_DEACTIVATED"}), 403
+    except Exception:
+        pass
+    if user["role"] == FARMER_ROLE:
+        # Password authentication is closed for farmers: even a correct legacy
+        # password must not mint a farmer session (checked *after* the password
+        # so the response never distinguishes a farmer from an unknown account
+        # for anyone who does not already know the password).
+        conn.close()
+        return jsonify({
+            "error": ("Farmers sign in with their mobile number and an OTP. "
+                      "Use the Farmer login screen to request an OTP."),
+            "code": "FARMER_OTP_REQUIRED",
+            "login_method": "mobile_otp",
+        }), 403
+
+    token = make_token(user)
+    audit_log(conn, "LOGIN", "user", user["id"], actor_id=user["id"],
+              actor_name=user["full_name"], actor_role=user["role"],
+              details={"identifier": identifier})
+    conn.commit()
+    conn.close()
+    return jsonify({"token": token, "user": public_user(user)})
+
+
+# ----------------------------------- GA-20: forgot password & deactivation --
+# Vet/Govt/Lab can request password reset; Farmers (owner) remain OTP-only.
+# Deactivation is soft-delete, preserves audit trail, blocks future logins.
+
+@app.post("/api/auth/forgot-password")
+@captcha_service.captcha_required(action="forgot_password")
+def forgot_password():
+    """
+    Request a password reset. Anti-enumeration: always returns same message,
+    even if account not found. Farmers (owner) get specific guidance.
+    """
+    data = request.get_json(silent=True) or {}
+    identifier = (data.get("identifier") or data.get("email") or data.get("mobile") or "").strip()
+    if not identifier:
+        return jsonify({"error": "Email or mobile is required."}), 400
+
+    conn = get_db()
+    try:
+        user = conn.execute(
+            "SELECT * FROM users WHERE email=? OR mobile=?", (identifier, identifier)
+        ).fetchone()
+        if not user:
+            # Anti-enumeration: same response even if not found
+            return jsonify({
+                "ok": True,
+                "message": "If an account exists with that email or mobile, a password reset link has been sent. Check your email or SMS. If you are a farmer, use OTP to sign in.",
+                "reference": secrets.token_hex(6),
+            }), 200
+
+        # Farmers cannot use password reset
+        if user["role"] == FARMER_ROLE:
+            return jsonify({
+                "ok": True,
+                "message": "Farmers sign in with mobile OTP, not password. Use the Farmer login screen to request an OTP.",
+                "code": "FARMER_OTP_REQUIRED",
+            }), 200
+
+        # Check if deactivated
+        account_status = user["account_status"] if "account_status" in user.keys() else "ACTIVE"
+        if account_status == "DEACTIVATED":
+            return jsonify({
+                "ok": True,
+                "message": "If an account exists with that email or mobile, a password reset link has been sent.",
+                "reference": secrets.token_hex(6),
+            }), 200
+
+        # Create reset token
+        from auth_recovery import create_reset_token_for_user
+        plain_token = create_reset_token_for_user(
+            user["id"], request_ip=_client_ip(), user_agent=request.headers.get("User-Agent", "")[:200]
+        )
+        if plain_token:
+            # In production, this token would be emailed/SMSed. For now, log reference only, never token.
+            # Audit log
+            try:
+                audit_log(conn, "FORGOT_PASSWORD_REQUEST", "user", user["id"], actor_id=user["id"],
+                          actor_name=user["full_name"], actor_role=user["role"],
+                          details={"identifier": identifier}, ip=_client_ip())
+                conn.commit()
+            except Exception:
+                pass
+            # For demo/testing, return reference, not token. Token would be sent via email.
+            # To avoid breaking existing flows, we include token only if DEMO_MODE or test env
+            response = {
+                "ok": True,
+                "message": "If an account exists with that email or mobile, a password reset link has been sent. In this demo, the reset token is included for testing.",
+                "reference": f"RST-{int(time.time())}-{secrets.token_hex(3).upper()}",
+            }
+            # Only expose token in demo/test mode, never in production with real secrets
+            if os.environ.get("DEMO_MODE") == "true" or os.environ.get("SIH_CAPTCHA_PROVIDER") == "test" or _flag("SIH_EXPOSE_RESET_TOKEN", False):
+                response["reset_token"] = plain_token
+                response["note"] = "This token is only exposed in demo/test mode. In production it would be emailed."
+            return jsonify(response), 200
+        else:
+            return jsonify({"error": "Could not create reset token. Please try again."}), 500
+    finally:
+        conn.close()
+
+
+@app.post("/api/auth/reset-password")
+def reset_password():
+    """Reset password using a reset token."""
+    data = request.get_json(silent=True) or {}
+    token = (data.get("token") or data.get("reset_token") or "").strip()
+    new_password = data.get("new_password") or data.get("password") or ""
+    confirm = data.get("confirm_password") or data.get("confirm") or ""
+
+    if not token:
+        return jsonify({"error": "Reset token is required."}), 400
+    if not new_password or len(new_password) < 6:
+        return jsonify({"error": "New password must be at least 6 characters."}), 400
+    if new_password != confirm and confirm:
+        return jsonify({"error": "Passwords do not match."}), 400
+    if len(new_password) > 128:
+        return jsonify({"error": "Password must be at most 128 characters."}), 400
+
+    from auth_recovery import verify_reset_token, consume_reset_token
+    result, err = verify_reset_token(token)
+    if err or not result:
+        return jsonify({"error": err or "Invalid reset token."}), 400
+
+    user_info = result["user"]
+    token_row = result["token_row"]
+
+    # Update password
+    conn = get_db()
+    try:
+        h, s = hash_password(new_password)
+        conn.execute(
+            "UPDATE users SET password_hash=?, salt=? WHERE id=?",
+            (h, s, user_info["id"]),
+        )
+        conn.commit()
+        # Consume token
+        consume_reset_token(token_row["id"])
+        # Audit
+        try:
+            audit_log(conn, "RESET_PASSWORD", "user", user_info["id"], actor_id=user_info["id"],
+                      actor_name=user_info["full_name"], actor_role=user_info["role"],
+                      details={"reset_token_id": token_row["id"]}, ip=_client_ip())
+            conn.commit()
+        except Exception:
+            pass
+        return jsonify({"ok": True, "message": "Password has been reset. You can now sign in with your new password."}), 200
+    except Exception:
+        return jsonify({"error": "Could not reset password."}), 500
+    finally:
+        conn.close()
+
+
+@app.post("/api/auth/deactivate")
+@auth_required()
+def deactivate_account():
+    """
+    Deactivate own account (soft delete). Preserves audit trail, blocks future logins.
+    Farmers can also deactivate, but must use OTP to re-activate via admin (ORG ACTION).
+    """
+    data = request.get_json(silent=True) or {}
+    reason = (data.get("reason") or data.get("deactivation_reason") or "").strip()[:500]
+    confirm = data.get("confirm") or data.get("confirmation") or ""
+
+    # Require explicit confirmation
+    if str(confirm).lower() not in ("yes", "true", "deactivate", "confirm"):
+        return jsonify({
+            "error": "Please confirm deactivation by sending {\"confirm\": \"yes\"}.",
+            "code": "CONFIRMATION_REQUIRED",
+        }), 400
+
+    user_id = g.user["uid"]
+    role = g.user["role"]
+
+    # Farmers can deactivate, but warn that re-activation needs admin
+    from auth_recovery import deactivate_user
+    try:
+        deactivate_user(user_id, reason=reason or f"User {role} requested deactivation", actor_id=user_id)
+        conn = get_db()
+        try:
+            audit_log(conn, "DEACTIVATE_ACCOUNT", "user", user_id, actor_id=user_id,
+                      actor_name=g.user["name"], actor_role=role,
+                      details={"reason": reason}, ip=_client_ip())
+            conn.commit()
+        except Exception:
+            pass
+        finally:
+            conn.close()
+        return jsonify({
+            "ok": True,
+            "message": "Account has been deactivated. Contact support to re-activate. You have been signed out.",
+            "code": "ACCOUNT_DEACTIVATED",
+        }), 200
+    except Exception:
+        return jsonify({"error": "Could not deactivate account."}), 500
+
+
+# ------------------------------------------- farmer OTP login (mobile) ----
+# Farmers sign in with a mobile number + SMS OTP issued through the capcom6
+# Android SMS Gateway (Cloud Server). Vet / Govt / Lab keep password login.
+# See otp_service.py for the security model and sms_gateway.py for the API
+# contract. OTP values are never returned by these endpoints nor logged.
+
+def _client_ip():
+    """Best-effort client IP for rate limiting (Render terminates TLS)."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    candidate = forwarded.split(",")[0].strip() if forwarded else (request.remote_addr or "")
+    if not candidate:
+        return None
+    try:
+        return str(ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def _otp_route_readiness_error():
+    """503 payload when OTP login cannot work, with the exact (safe) reason."""
+    status = otp_login_status()
+    code = status["blockers"][0] if status["blockers"] else "SMS_GATEWAY_NOT_CONFIGURED"
+    return jsonify({
+        # No password fallback exists for farmers: the farmer is told to retry
+        # and to call the helpline rather than being sent to a dead end.
+        "error": "OTP login is not available right now. Please try again shortly.",
+        "code": code,
+        "helpline": get_ivr_settings().display_number,
+    }), 503
+
+
+def _otp_request_intent(data) -> tuple[str, bool]:
+    """Return ``(intent, allow_unregistered)`` for an OTP request body.
+
+    ``intent=signup`` (farmer profile creation) may issue an OTP for a number
+    without an account; the default ``login`` intent never does. Anything
+    unrecognised falls back to the safe ``login`` behaviour.
+    """
+    raw = str(data.get("intent") or data.get("purpose") or "").strip().lower()
+    if raw in ("signup", "register", "registration"):
+        return "signup", True
+    return "login", False
+
+
+def _is_demo_login_request(mobile) -> bool:
+    """True only for the configured demo number while demo mode is enabled.
+
+    The prototype demo farmer never receives an SMS, so the route-level SMS
+    gateway readiness gate does not apply to it. Every other number — including
+    the demo number when demo mode is off — is gated exactly as before.
+    """
+    return demo_auth.is_demo_farmer(mobile)
+
+
+def _otp_neutral_message(result, *, resend: bool = False) -> str:
+    """Delivery-agnostic wording, identical for registered and unknown numbers.
+
+    A 200 from this API means "request accepted" — never "the SMS arrived".
+    """
+    minutes = max(1, int(round((result.get("expires_in") or 300) / 60)))
+    prefix = ("If this mobile number is registered, a new OTP has been sent"
+              if resend else "If this mobile number is registered, an OTP has been sent")
+    return f"{prefix}. It is valid for {minutes} minutes."
+
+
+def _demo_otp_message() -> str:
+    """Wording for the prototype demo farmer — explicitly no SMS was sent.
+
+    The fixed demo code is deliberately *not* echoed here: the login screen
+    already shows it (that is the point of the demo account) and this response
+    must not become a second place where a code travels.
+    """
+    return ("Demo account: no SMS is sent for this number. Enter the demo OTP "
+            "shown in the Demo Account box on this screen.")
+
+
+def _log_otp_dispatch(action: str, mobile, result: dict) -> None:
+    """Structured, secret-free record of what actually left the server."""
+    logging.getLogger(__name__).info(
+        "%s recipient=%s dispatch=%s gateway_mode=%s gateway_state=%s message_id=%s "
+        "http_status=%s simulated=%s",
+        action, sms_gateway.mask_phone(mobile),
+        "submitted_to_gateway" if result.get("sent") else "not_dispatched",
+        result.get("gateway_mode"), result.get("gateway_state"),
+        result.get("gateway_message_id"), result.get("gateway_http_status"),
+        bool(result.get("simulated")),
+    )
+
+
+def _audit_otp_event(action, *, user_id=None, mobile=None, details=None):
+    """Audit OTP lifecycle events. Mobile numbers are masked, codes never logged."""
+    safe_mobile = sms_gateway.mask_phone(mobile) if mobile else None
+    payload = dict(details or {})
+    if safe_mobile:
+        payload["mobile"] = safe_mobile
+    try:
+        conn = get_db()
+        audit_log(conn, action, "user", user_id or "-", actor_id=user_id,
+                  actor_role="owner", details=payload, ip=_client_ip())
+        conn.commit()
+        conn.close()
+    except Exception:  # never block login on an audit failure
+        logging.getLogger(__name__).warning("Failed to write %s audit event", action)
+
+
+@app.get("/api/auth/farmer/config")
+def farmer_auth_config():
+    """Public, non-secret OTP settings for the farmer login/signup screen.
+
+    ``settings["demo"]`` describes the prototype demo account. While demo mode
+    is off it is exactly ``{"enabled": false}`` — no number, no code, so the
+    screen has nothing to show. See demo_auth.py and DEMO_ACCOUNT.md.
+    """
+    settings = otp_public_settings()
+    # Farmer authentication is OTP-only: there is no password login to fall back
+    # to (Vet / Govt / Lab keep their original password login on /api/auth/login).
+    settings["password_login_enabled"] = False
+    settings["signup_enabled"] = True
+    settings["helpline"] = get_ivr_settings().display_number
+    # Phone OTP via Clerk (publishable key only — it is public by design).
+    settings["phone_auth"] = clerk_auth.public_settings()
+    return jsonify(settings)
+
+
+@app.post("/api/auth/farmer/phone-start")
+def farmer_phone_start_route():
+    """Pre-register a mobile number with Clerk so the browser only signs in.
+
+    Avoids Clerk's browser sign-up (CAPTCHA + dashboard sign-up requirements).
+    No SMS is sent here and nothing about local accounts is revealed.
+    """
+    if not clerk_auth.is_enabled():
+        return jsonify({"error": "OTP login is not available right now.",
+                        "code": "CLERK_NOT_CONFIGURED"}), 503
+    if not shared_rate_limit_ok(f"phone-start:{_client_ip() or 'unknown'}"):
+        return jsonify({"error": "Too many requests. Please wait and try again.",
+                        "code": "RATE_LIMITED"}), 429
+    data = request.get_json(silent=True) or {}
+    from ivr_config import normalize_indian_number
+    e164 = normalize_indian_number(data.get("mobile"))
+    if not e164:
+        return jsonify({"error": "Please enter a valid 10-digit mobile number.",
+                        "code": "INVALID_MOBILE"}), 400
+    try:
+        clerk_auth.ensure_phone_user(e164)
+    except clerk_auth.ClerkAuthError as exc:
+        return jsonify({"error": exc.message, "code": exc.code}), exc.status
+    return jsonify({"ok": True})
+
+
+@app.post("/api/auth/farmer/clerk")
+def farmer_clerk_login_route():
+    """Exchange a Clerk session token (phone verified by SMS OTP) for the app JWT.
+
+    Existing farmer -> normal login. Unknown number -> the same
+    ``registration_required`` + single-use ``registration_token`` response as
+    ``verify-otp``, so the farmer continues to ``/api/auth/farmer/register``.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        phone = clerk_auth.verified_phone_from_token(data.get("token"))
+    except clerk_auth.ClerkAuthError as exc:
+        return jsonify({"error": exc.message, "code": exc.code}), exc.status
+
+    from ivr_config import normalize_indian_number
+    e164 = normalize_indian_number(phone)
+    if not e164:
+        return jsonify({"error": "Please use an Indian mobile number.",
+                        "code": "INVALID_MOBILE"}), 400
+
+    conn = get_db()
+    try:
+        user = find_user_by_mobile(conn, e164)
+    finally:
+        conn.close()
+
+    if user is None:
+        token = issue_external_registration_token(e164, source="clerk", ip=_client_ip())
+        _audit_otp_event("OTP_VERIFIED_SIGNUP", mobile=e164,
+                         details={"purpose": "farmer_signup", "provider": "clerk"})
+        return jsonify({
+            "registration_required": True,
+            "registration_token": token,
+            "mobile": e164[-10:],
+            "role": FARMER_ROLE,
+            "expires_in": registration_token_ttl_seconds(),
+        })
+
+    if user["role"] != FARMER_ROLE:
+        _audit_otp_event("OTP_ROLE_REJECTED", user_id=user["id"], mobile=e164,
+                         details={"provider": "clerk"})
+        return jsonify({"error": "This mobile number belongs to a staff account. "
+                                 "Please use the correct portal.",
+                        "code": "FORBIDDEN_ROLE"}), 403
+
+    _audit_otp_event("LOGIN", user_id=user["id"], mobile=e164,
+                     details={"method": "otp", "purpose": "farmer_login", "provider": "clerk"})
+    return jsonify({"token": make_token(user), "user": public_user(user),
+                    "login_method": "otp", "demo": False})
+
+
+@app.post("/api/auth/farmer/request-otp")
+@captcha_service.captcha_required(action="farmer_request_otp")
+def farmer_request_otp_route():
+    """Send an OTP to a farmer's mobile number.
+
+    ``intent=login`` (default) only ever reaches a registered farmer account;
+    ``intent=signup`` is the farmer profile-creation flow and may also reach a
+    number that has no account yet. Both intents share every rate limit,
+    cooldown and anti-enumeration rule.
+    """
+    data = request.get_json(silent=True) or {}
+    mobile = data.get("mobile") or data.get("phone") or data.get("identifier")
+    intent, allow_unregistered = _otp_request_intent(data)
+
+    if not mobile:
+        return jsonify({"error": "Mobile number is required.", "code": "INVALID_MOBILE"}), 400
+
+    if not otp_login_available() and not _is_demo_login_request(mobile):
+        # Fail loudly instead of pretending an SMS was sent. The code tells the
+        # operator exactly what to fix (gateway config vs. unstable OTP pepper).
+        return _otp_route_readiness_error()
+
+    try:
+        result = request_farmer_otp(mobile, ip=_client_ip(),
+                                    allow_unregistered=allow_unregistered)
+    except OtpError as exc:
+        logging.getLogger(__name__).warning(
+            "farmer_otp_request_failed recipient=%s error_code=%s reason=%s http_status=%s",
+            sms_gateway.mask_phone(mobile), exc.code, exc.reason, exc.status,
+        )
+        if exc.code not in ("COOLDOWN_ACTIVE", "RATE_LIMITED"):
+            _audit_otp_event("OTP_REQUEST_FAILED", mobile=mobile,
+                             details={"code": exc.code, "reason": exc.reason})
+        return jsonify(exc.to_payload()), exc.status
+
+    _log_otp_dispatch("farmer_otp_request_accepted", mobile, result)
+    if result.get("sent"):
+        _audit_otp_event("OTP_REQUESTED", mobile=mobile,
+                         details={"purpose": "farmer_login", "intent": intent,
+                                  "expires_in": result.get("expires_in"),
+                                  "message_id": result.get("gateway_message_id"),
+                                  "message_state": result.get("gateway_state"),
+                                  "http_status": result.get("gateway_http_status"),
+                                  "simulated": bool(result.get("simulated"))})
+
+    if result.get("demo"):
+        # The prototype demo farmer: no SMS was sent and the fixed code is
+        # already on the login screen. Anti-enumeration does not apply to this
+        # one publicly documented number, so the wording is explicit instead of
+        # neutral — the UI must never claim an SMS was sent.
+        _audit_otp_event("DEMO_OTP_REQUESTED", mobile=mobile,
+                         details={"purpose": "farmer_login", "intent": intent,
+                                  "expires_in": result.get("expires_in")})
+        return jsonify({
+            "ok": True,
+            "demo": True,
+            "message": _demo_otp_message(),
+            "delivery_confirmed": False,
+            "sms_sent": False,
+            "expires_in": result.get("expires_in"),
+            "resend_after": result.get("resend_after"),
+        })
+
+    # Identical response whether or not the number is registered (no enumeration).
+    # delivery_confirmed is always False: a 200 means the request was accepted,
+    # never that an SMS was delivered.
+    return jsonify({
+        "ok": True,
+        "demo": False,
+        "message": _otp_neutral_message(result),
+        "delivery_confirmed": False,
+        "expires_in": result.get("expires_in"),
+        "resend_after": result.get("resend_after"),
+    })
+
+
+@app.post("/api/auth/farmer/resend-otp")
+def farmer_resend_otp_route():
+    """Resend a login OTP. Enforces the 60-second resend cooldown."""
+    data = request.get_json(silent=True) or {}
+    mobile = data.get("mobile") or data.get("phone") or data.get("identifier")
+    intent, allow_unregistered = _otp_request_intent(data)
+
+    if not mobile:
+        return jsonify({"error": "Mobile number is required.", "code": "INVALID_MOBILE"}), 400
+
+    if not otp_login_available() and not _is_demo_login_request(mobile):
+        return _otp_route_readiness_error()
+
+    try:
+        result = resend_farmer_otp(mobile, ip=_client_ip(),
+                                   allow_unregistered=allow_unregistered)
+    except OtpError as exc:
+        logging.getLogger(__name__).warning(
+            "farmer_otp_resend_failed recipient=%s error_code=%s reason=%s http_status=%s",
+            sms_gateway.mask_phone(mobile), exc.code, exc.reason, exc.status,
+        )
+        if exc.code != "COOLDOWN_ACTIVE":
+            _audit_otp_event("OTP_RESEND_FAILED", mobile=mobile,
+                             details={"code": exc.code, "reason": exc.reason})
+        return jsonify(exc.to_payload()), exc.status
+
+    _log_otp_dispatch("farmer_otp_resend_accepted", mobile, result)
+    if result.get("sent"):
+        _audit_otp_event("OTP_RESENT", mobile=mobile,
+                         details={"purpose": "farmer_login", "intent": intent,
+                                  "message_id": result.get("gateway_message_id"),
+                                  "message_state": result.get("gateway_state"),
+                                  "simulated": bool(result.get("simulated"))})
+
+    if result.get("demo"):
+        return jsonify({
+            "ok": True,
+            "demo": True,
+            "message": _demo_otp_message(),
+            "delivery_confirmed": False,
+            "sms_sent": False,
+            "expires_in": result.get("expires_in"),
+            "resend_after": result.get("resend_after"),
+        })
+
+    return jsonify({
+        "ok": True,
+        "demo": False,
+        "message": _otp_neutral_message(result, resend=True),
+        "delivery_confirmed": False,
+        "expires_in": result.get("expires_in"),
+        "resend_after": result.get("resend_after"),
+    })
+
+
+@app.post("/api/auth/farmer/verify-otp")
+def farmer_verify_otp_route():
+    """Verify the OTP and issue the same JWT the password login returns."""
+    data = request.get_json(silent=True) or {}
+    mobile = data.get("mobile") or data.get("phone")
+    code = data.get("otp") or data.get("code") or data.get("otp_code")
+
+    if not mobile:
+        return jsonify({"error": "Mobile number is required.", "code": "INVALID_MOBILE"}), 400
+    if not code:
+        return jsonify({"error": "The OTP is required.", "code": "INVALID_OTP_FORMAT"}), 400
+
+    try:
+        result = verify_farmer_otp(mobile, code, ip=_client_ip())
+    except OtpError as exc:
+        # The exact cause (no_otp_row / code_mismatch / pepper_mismatch /
+        # expired / status=SEND_FAILED ...) goes to the log and the audit trail,
+        # never to the client — the response stays generic (no enumeration).
+        logging.getLogger(__name__).warning(
+            "farmer_otp_verify_failed recipient=%s error_code=%s reason=%s http_status=%s",
+            sms_gateway.mask_phone(mobile), exc.code, exc.reason, exc.status,
+        )
+        _audit_otp_event("OTP_VERIFY_FAILED", mobile=mobile,
+                         details={"code": exc.code, "reason": exc.reason})
+        return jsonify(exc.to_payload()), exc.status
+
+    if result.get("registration_required"):
+        # Phone verified, no farmer account yet: the client continues to the
+        # farmer profile step. No JWT is issued — only the signed, short-lived
+        # registration token that is bound to this exact number.
+        _audit_otp_event("OTP_VERIFIED_SIGNUP", mobile=result.get("mobile_e164"),
+                         details={"purpose": "farmer_signup"})
+        return jsonify({
+            "registration_required": True,
+            "registration_token": result["registration_token"],
+            "mobile": str(result.get("mobile_e164") or "")[-10:],
+            "role": FARMER_ROLE,
+            "expires_in": registration_token_ttl_seconds(),
+            "delivery_confirmed": False,
+        })
+
+    user = result["user"]
+    # Defence in depth: a farmer OTP must never authenticate another role.
+    if user.get("role") != FARMER_ROLE:
+        _audit_otp_event("OTP_ROLE_REJECTED", user_id=user.get("id"), mobile=mobile)
+        return jsonify({"error": "Forbidden for this role", "code": "FORBIDDEN_ROLE"}), 403
+
+    # GA-20: block deactivated accounts
+    try:
+        # user may be dict from otp_service, need to check DB for account_status
+        conn = get_db()
+        db_user = conn.execute("SELECT account_status FROM users WHERE id=?", (user.get("id"),)).fetchone()
+        conn.close()
+        if db_user and db_user["account_status"] == "DEACTIVATED":
+            return jsonify({"error": "Account is deactivated. Contact support.", "code": "ACCOUNT_DEACTIVATED"}), 403
+    except Exception:
+        pass
+
+    token = make_token(user)
+    # The token, the claims and the role are produced by the unchanged
+    # make_token()/public_user() path — a demo login is an ordinary farmer
+    # session, which is why it can open the normal farmer dashboard.
+    is_demo = demo_auth.is_demo_farmer(mobile)
+    _audit_otp_event("LOGIN", user_id=user["id"], mobile=mobile,
+                     details={"method": "otp", "purpose": "farmer_login",
+                              "demo": is_demo})
+    return jsonify({"token": token, "user": public_user(user), "login_method": "otp",
+                    "demo": is_demo})
+
+
+@app.post("/api/auth/farmer/register")
+def farmer_register_route():
+    """Create the farmer profile for a phone number verified by OTP.
+
+    Requires the ``registration_token`` returned by
+    ``POST /api/auth/farmer/verify-otp`` — the number comes from that signed
+    token, never from the request body, so a verification cannot be reused for
+    a different mobile. The token is single use (spent here, even when the
+    account turns out to exist already). The account is always created with
+    ``role='owner'``; there is no password and no client-supplied role.
+    """
+    data = request.get_json(force=True) or {}
+    registration_token = data.get("registration_token")
+
+    full_name = str(data.get("full_name") or "").strip()
+    district = str(data.get("district") or "").strip()
+    missing = [label for label, value in (("full_name", full_name), ("district", district))
+               if not value]
+    if missing:
+        return jsonify({"error": f"Missing fields: {', '.join(missing)}",
+                        "code": "MISSING_PROFILE_FIELDS",
+                        "required_fields": ["full_name", "district"]}), 400
+    if len(full_name) < 2:
+        return jsonify({"error": "Please enter your full name.",
+                        "code": "INVALID_PROFILE"}), 400
+
+    preferred_language = (data.get("preferred_language") or "").strip().lower() or None
+    if preferred_language and preferred_language not in SUPPORTED_LANGUAGES:
+        return jsonify({"error": "Preferred language must be en, te, hi, or mr",
+                        "code": "INVALID_PROFILE"}), 400
+
+    supplied_email = str(data.get("email") or "").strip()
+
+    conn = get_db()
+    try:
+        # BEGIN IMMEDIATE makes the token claim, the uniqueness check and the
+        # INSERT one atomic step, so two concurrent signups for one number (or
+        # with one token) cannot both succeed.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            e164 = consume_registration_token(conn, registration_token)
+            if not e164:
+                conn.execute("ROLLBACK")
+                return jsonify({
+                    "error": "This verification has expired. Please request a new OTP.",
+                    "code": "REGISTRATION_TOKEN_INVALID",
+                }), 401
+            # ``users.email`` is UNIQUE NOT NULL but is not an authentication
+            # identifier for farmers, so a phone-verified farmer without an
+            # email gets a deterministic, non-routable placeholder instead of a
+            # schema change.
+            contact_email = supplied_email or f"{e164.lstrip('+')}@mobile.pashumitra.local"
+            mobile_local = e164[-10:]
+
+            if supplied_email:
+                # ``users.email`` is UNIQUE; check it behind the verified phone
+                # so the endpoint cannot be used to probe for existing emails.
+                taken = conn.execute("SELECT id FROM users WHERE email=?",
+                                     (contact_email,)).fetchone()
+                if taken:
+                    # Nothing is spent: this is a retryable input error.
+                    conn.execute("ROLLBACK")
+                    return jsonify({"error": "An account with this email already exists.",
+                                    "code": "ACCOUNT_EXISTS"}), 409
+
+            existing = find_user_by_mobile(conn, e164)
+            if existing:
+                # The token is spent even on this path: it has been used.
+                conn.execute("COMMIT")
+                if existing["role"] != FARMER_ROLE:
+                    # Never hand out a session for a staff account here.
+                    return jsonify({
+                        "error": "This mobile number belongs to a staff account. "
+                                 "Please use the correct portal.",
+                        "code": "ACCOUNT_EXISTS_WRONG_PORTAL",
+                    }), 409
+                # The number gained a farmer account after the OTP was issued:
+                # log that account in instead of creating a duplicate.
+                token = make_token(existing)
+                _audit_otp_event("REGISTER_EXISTING_LOGIN", user_id=existing["id"],
+                                 mobile=e164, details={"purpose": "farmer_signup"})
+                return jsonify({"token": token, "user": public_user(existing),
+                                "login_method": "otp", "registered": False})
+
+            pw_hash, salt = otp_only_credentials()
+            cur = conn.execute(
+                "INSERT INTO users (full_name, mobile, email, password_hash, salt, role, "
+                "preferred_language, village, block, district, state) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (full_name, mobile_local, contact_email, pw_hash, salt, FARMER_ROLE,
+                 preferred_language, (data.get("village") or None),
+                 (data.get("block") or None), district,
+                 (data.get("state") or "Maharashtra")),
+            )
+            user_id = cur.lastrowid
+            audit_log(conn, "REGISTER_USER", "user", user_id, actor_id=user_id,
+                      actor_name=full_name, actor_role=FARMER_ROLE,
+                      details={"mobile": sms_gateway.mask_phone(e164),
+                               "role": FARMER_ROLE, "method": "mobile_otp"})
+            conn.execute("COMMIT")
+        except sqlite3.IntegrityError:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            existing = find_user_by_mobile(conn, e164)
+            if existing and existing["role"] == FARMER_ROLE:
+                token = make_token(existing)
+                return jsonify({"token": token, "user": public_user(existing),
+                                "login_method": "otp", "registered": False})
+            return jsonify({"error": "An account with this mobile number already exists.",
+                            "code": "ACCOUNT_EXISTS"}), 409
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+        user = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        token = make_token(user)
+        _audit_otp_event("REGISTER_FARMER_OTP", user_id=user_id, mobile=e164,
+                         details={"purpose": "farmer_signup", "method": "mobile_otp"})
+        logging.getLogger(__name__).info(
+            "farmer_profile_created user_id=%s recipient=%s source=mobile_otp_verified",
+            user_id, sms_gateway.mask_phone(e164),
+        )
+        return jsonify({"token": token, "user": public_user(user),
+                        "login_method": "otp", "registered": True}), 201
+    finally:
+        conn.close()
+
+
+@app.get("/api/users/me")
+@auth_required()
+def me():
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE id=?", (g.user["uid"],)).fetchone()
+    conn.close()
+    return jsonify(public_user(user))
+
+
+# --------------------------------------------------------------- herds ---
+@app.post("/api/herds")
+@auth_required(roles=["owner"])
+def create_herd():
+    data = request.get_json(force=True) or {}
+    conn = get_db()
+    owner = conn.execute("SELECT * FROM users WHERE id=?", (g.user["uid"],)).fetchone()
+    district = data.get("district") or owner["district"] or "PUN"
+    code = next_code(conn, "HERD", "herds", "herd_code", district=district[:3].upper())
+    cur = conn.execute(
+        "INSERT INTO herds (herd_code, owner_id, village, block, district, state) VALUES (?,?,?,?,?,?)",
+        (code, g.user["uid"], data.get("village", owner["village"]), data.get("block", owner["block"]),
+         district, data.get("state", "Maharashtra")),
+    )
+    herd_id = cur.lastrowid
+    audit_log(conn, "CREATE_HERD", "herd", herd_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"], details={"herd_code": code})
+    conn.commit()
+    herd = conn.execute("SELECT * FROM herds WHERE id=?", (herd_id,)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(herd)), 201
+
+
+@app.get("/api/herds")
+@auth_required()
+def list_herds():
+    conn = get_db()
+    if g.user["role"] == "owner":
+        herds = conn.execute("SELECT * FROM herds WHERE owner_id=? ORDER BY id DESC", (g.user["uid"],)).fetchall()
+    else:
+        herds = conn.execute("SELECT * FROM herds ORDER BY id DESC").fetchall()
+    out = []
+    for h in herds:
+        hd = dict(h)
+        hd["animal_count"] = conn.execute("SELECT COUNT(*) c FROM animals WHERE herd_id=?", (h["id"],)).fetchone()["c"]
+        hd["active_cases"] = conn.execute(
+            "SELECT COUNT(*) c FROM cases WHERE herd_id=? AND status NOT IN ('CLOSED','RECOVERED')",
+            (h["id"],)
+        ).fetchone()["c"]
+        out.append(hd)
+    conn.close()
+    return jsonify(out)
+
+
+# ------------------------------------------------------------- animals ---
+@app.post("/api/animals")
+@auth_required(roles=["owner"])
+def create_animal():
+    data = request.get_json(force=True) or {}
+    # Systematic validation (GA-1-5)
+    v_errors = validation_service.validate_animal(data)
+    if v_errors:
+        return jsonify({"error": "Validation failed", "fields": v_errors, "code": "VALIDATION_FAILED"}), 422
+    animal_type = data.get("animal_type") or data.get("species")
+    if not animal_type:
+        return jsonify({"error": "Animal type is required"}), 400
+    conn = get_db()
+    try:
+        owner = conn.execute("SELECT * FROM users WHERE id=?", (g.user["uid"],)).fetchone()
+        district = data.get("district") or owner["district"] or "PUN"
+        code = next_code(conn, "MH", "animals", "animal_code", district=district[:3].upper())
+        herd_id = data.get("herd_id") or None
+        if herd_id:
+            herd = conn.execute("SELECT * FROM herds WHERE id=? AND owner_id=?", (herd_id, g.user["uid"])).fetchone()
+            if not herd:
+                return jsonify({"error": "Invalid herd ID"}), 400
+        age = data.get("age") or data.get("age_years")
+        owner_name = data.get("owner_name") or owner["full_name"]
+        mobile = data.get("mobile") or owner["mobile"]
+        cur = conn.execute(
+            "INSERT INTO animals (animal_code, owner_id, herd_id, animal_name, animal_type, species, breed, gender, sex, age, age_years, owner_name, mobile, village, block, district, state, status) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (code, g.user["uid"], herd_id, data.get("animal_name"), animal_type, animal_type, data.get("breed"),
+             data.get("gender"), data.get("gender"), age, age, owner_name, mobile,
+             data.get("village", owner["village"]), data.get("block", owner["block"]), district,
+             data.get("state", "Maharashtra"), data.get("status", "Healthy")),
+        )
+        animal_id = cur.lastrowid
+
+        # Generate secure QR code identity
+        token = f"aqr_{uuid.uuid4().hex}"
+        payload = f"PASHU:ANIMAL:{token}"
+        conn.execute(
+            "INSERT INTO animal_qr_codes (animal_id, qr_token, qr_payload, status) VALUES (?,?,?,'ACTIVE')",
+            (animal_id, token, payload)
+        )
+        audit_log(conn, "CREATE_ANIMAL", "animal", animal_id, actor_id=g.user["uid"],
+                  actor_name=g.user["name"], actor_role=g.user["role"],
+                  details={"animal_code": code, "qr_token": token})
+
+        conn.commit()
+        animal = conn.execute("SELECT * FROM animals WHERE id=?", (animal_id,)).fetchone()
+        res = row_to_dict(animal)
+        res["qr_token"] = token
+        res["qr_payload"] = payload
+        res["qr_image"] = make_qr_image_data_url(payload)
+        return jsonify(res), 201
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        return jsonify({"error": "Could not save this animal. Please check the details and try again."}), 400
+    finally:
+        conn.close()
+
+
+@app.delete("/api/animals/<int:animal_id>")
+@auth_required(roles=["owner"])
+def delete_animal(animal_id):
+    conn = get_db()
+    try:
+        animal = conn.execute(
+            "SELECT * FROM animals WHERE id=? AND owner_id=?", (animal_id, g.user["uid"])
+        ).fetchone()
+        if not animal:
+            return jsonify({"error": "Animal not found"}), 404
+
+        conn.execute("DELETE FROM animal_qr_codes WHERE animal_id=?", (animal_id,))
+        conn.execute("DELETE FROM animal_reproductive_records WHERE animal_id=?", (animal_id,))
+        conn.execute("DELETE FROM animal_allergies WHERE animal_id=?", (animal_id,))
+        conn.execute("DELETE FROM animal_medications WHERE animal_id=?", (animal_id,))
+        conn.execute("DELETE FROM ai_animal_assessments WHERE animal_id=?", (animal_id,))
+        conn.execute("DELETE FROM treatment_responses WHERE animal_id=?", (animal_id,))
+        conn.execute("DELETE FROM sample_custody_events WHERE sample_id IN (SELECT id FROM samples WHERE animal_id=?)", (animal_id,))
+        conn.execute("DELETE FROM samples WHERE animal_id=?", (animal_id,))
+        conn.execute("DELETE FROM case_updates WHERE case_id IN (SELECT id FROM cases WHERE animal_id=?)", (animal_id,))
+        conn.execute("DELETE FROM lab_reports WHERE animal_id=?", (animal_id,))
+        conn.execute("DELETE FROM lab_requests WHERE animal_id=?", (animal_id,))
+        conn.execute("DELETE FROM prescriptions WHERE animal_id=?", (animal_id,))
+        conn.execute("DELETE FROM vaccinations WHERE animal_id=?", (animal_id,))
+        conn.execute("DELETE FROM cases WHERE animal_id=?", (animal_id,))
+        conn.execute("DELETE FROM animals WHERE id=?", (animal_id,))
+
+        audit_log(conn, "DELETE_ANIMAL", "animal", animal_id, actor_id=g.user["uid"],
+                  actor_name=g.user["name"], actor_role=g.user["role"],
+                  details={"animal_code": animal["animal_code"]})
+        conn.commit()
+        return jsonify({"ok": True, "deleted": animal["animal_code"]})
+    finally:
+        conn.close()
+
+
+@app.get("/api/animals")
+@auth_required()
+def list_animals():
+    conn = get_db()
+    if g.user["role"] == "owner":
+        animals = conn.execute("SELECT * FROM animals WHERE owner_id=? ORDER BY id DESC", (g.user["uid"],)).fetchall()
+    else:
+        animals = conn.execute("SELECT * FROM animals ORDER BY id DESC").fetchall()
+    conn.close()
+    return jsonify([row_to_dict(a) for a in animals])
+
+
+@app.get("/api/animals/<int:animal_id>")
+@auth_required()
+def get_animal(animal_id):
+    conn = get_db()
+    animal = conn.execute("SELECT * FROM animals WHERE id=?", (animal_id,)).fetchone()
+    if not animal:
+        conn.close()
+        return jsonify({"error": "Animal not found"}), 404
+    if g.user["role"] == "owner" and animal["owner_id"] != g.user["uid"]:
+        conn.close()
+        return jsonify({"error": "Not authorized to view this animal"}), 403
+
+    cases = conn.execute("SELECT * FROM cases WHERE animal_id=? ORDER BY id DESC", (animal_id,)).fetchall()
+    vaccinations = conn.execute(
+        "SELECT v.*, u.full_name vet_name FROM vaccinations v LEFT JOIN users u ON u.id=v.vet_id "
+        "WHERE animal_id=? ORDER BY date_given DESC", (animal_id,)
+    ).fetchall()
+    lab_reports = conn.execute("SELECT * FROM lab_reports WHERE animal_id=? ORDER BY id DESC", (animal_id,)).fetchall()
+    prescriptions = conn.execute(
+        "SELECT p.*, u.full_name vet_name FROM prescriptions p LEFT JOIN users u ON u.id=p.vet_id "
+        "WHERE animal_id=? ORDER BY id DESC", (animal_id,)
+    ).fetchall()
+    herd = conn.execute("SELECT * FROM herds WHERE id=?", (animal["herd_id"],)).fetchone() if animal["herd_id"] else None
+
+    # Extended entities
+    qr_row = conn.execute("SELECT * FROM animal_qr_codes WHERE animal_id=? AND status='ACTIVE' ORDER BY id DESC LIMIT 1", (animal_id,)).fetchone()
+    qr_data = row_to_dict(qr_row)
+    if qr_data:
+        qr_data["qr_image"] = make_qr_image_data_url(qr_data["qr_payload"])
+
+    reproductive_records = conn.execute(
+        "SELECT r.*, u.full_name recorded_by_name FROM animal_reproductive_records r LEFT JOIN users u ON u.id=r.recorded_by "
+        "WHERE animal_id=? ORDER BY id DESC", (animal_id,)
+    ).fetchall()
+    allergies = conn.execute(
+        "SELECT a.*, u.full_name recorded_by_name FROM animal_allergies a LEFT JOIN users u ON u.id=a.recorded_by "
+        "WHERE animal_id=? ORDER BY id DESC", (animal_id,)
+    ).fetchall()
+    medications = conn.execute(
+        "SELECT m.*, u.full_name prescribed_by_name FROM animal_medications m LEFT JOIN users u ON u.id=m.prescribed_by "
+        "WHERE animal_id=? ORDER BY id DESC", (animal_id,)
+    ).fetchall()
+
+    result = row_to_dict(animal)
+    result["herd"] = row_to_dict(herd)
+    result["cases"] = [row_to_dict(c) for c in cases]
+    result["vaccinations"] = [row_to_dict(v) for v in vaccinations]
+    result["lab_reports"] = [row_to_dict(l) for l in lab_reports]
+    result["prescriptions"] = [row_to_dict(p) for p in prescriptions]
+    result["qr"] = qr_data
+    result["reproductive_records"] = [row_to_dict(r) for r in reproductive_records]
+    result["allergies"] = [row_to_dict(a) for a in allergies]
+    result["medications"] = [row_to_dict(m) for m in medications]
+
+    # Precompute animal AI decision support
+    try:
+        cds = animal_ai.evaluate_animal_cds(
+            dict(animal), [dict(c) for c in cases], [dict(v) for v in vaccinations],
+            [dict(l) for l in lab_reports], [dict(r) for r in reproductive_records],
+            [dict(al) for al in allergies], [dict(m) for m in medications]
+        )
+        result["ai_decision_support"] = cds
+    except Exception:
+        result["ai_decision_support"] = None
+
+    conn.close()
+    return jsonify(result)
+
+
+# ----------------------------------------------- QR animal identity endpoints --
+@app.get("/api/animals/<int:animal_id>/qr")
+@auth_required()
+def get_animal_qr(animal_id):
+    conn = get_db()
+    animal = conn.execute("SELECT * FROM animals WHERE id=?", (animal_id,)).fetchone()
+    if not animal:
+        conn.close()
+        return jsonify({"error": "Animal not found"}), 404
+    qr = conn.execute("SELECT * FROM animal_qr_codes WHERE animal_id=? AND status='ACTIVE' ORDER BY id DESC LIMIT 1", (animal_id,)).fetchone()
+    if not qr:
+        token = f"aqr_{uuid.uuid4().hex}"
+        payload = f"PASHU:ANIMAL:{token}"
+        conn.execute("INSERT INTO animal_qr_codes (animal_id, qr_token, qr_payload, status) VALUES (?,?,?,'ACTIVE')", (animal_id, token, payload))
+        conn.commit()
+        qr = conn.execute("SELECT * FROM animal_qr_codes WHERE animal_id=? AND status='ACTIVE'", (animal_id,)).fetchone()
+    conn.close()
+    res = row_to_dict(qr)
+    res["qr_image"] = make_qr_image_data_url(res["qr_payload"])
+    res["animal_code"] = animal["animal_code"]
+    res["species"] = animal["species"]
+    return jsonify(res)
+
+
+@app.post("/api/animals/<int:animal_id>/qr")
+@auth_required(roles=["owner", "vet", "govt"])
+def regenerate_animal_qr(animal_id):
+    conn = get_db()
+    try:
+        animal = conn.execute("SELECT * FROM animals WHERE id=?", (animal_id,)).fetchone()
+        if not animal:
+            return jsonify({"error": "Animal not found"}), 404
+
+        new_token = f"aqr_{uuid.uuid4().hex}"
+        new_payload = f"PASHU:ANIMAL:{new_token}"
+        existing = conn.execute("SELECT id FROM animal_qr_codes WHERE animal_id=?", (animal_id,)).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE animal_qr_codes SET qr_token=?, qr_payload=?, status='ACTIVE', created_at=datetime('now') WHERE animal_id=?",
+                (new_token, new_payload, animal_id)
+            )
+            qr_id = existing["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO animal_qr_codes (animal_id, qr_token, qr_payload, status) VALUES (?,?,?,'ACTIVE')",
+                (animal_id, new_token, new_payload)
+            )
+            qr_id = cur.lastrowid
+
+        audit_log(conn, "REGENERATE_QR", "animal", animal_id, actor_id=g.user["uid"],
+                  actor_name=g.user["name"], actor_role=g.user["role"],
+                  details={"animal_code": animal["animal_code"], "new_qr_token": new_token})
+        conn.commit()
+        qr = conn.execute("SELECT * FROM animal_qr_codes WHERE id=?", (qr_id,)).fetchone()
+        res = row_to_dict(qr)
+        res["qr_image"] = make_qr_image_data_url(res["qr_payload"])
+        return jsonify(res), 201
+    finally:
+        conn.close()
+
+
+@app.post("/api/animals/<int:animal_id>/qr/revoke")
+@auth_required(roles=["owner", "vet", "govt"])
+def revoke_animal_qr(animal_id):
+    conn = get_db()
+    conn.execute("UPDATE animal_qr_codes SET status='REVOKED', revoked_at=datetime('now'), revoked_by=? WHERE animal_id=?", (g.user["uid"], animal_id))
+    audit_log(conn, "REVOKE_QR", "animal", animal_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"])
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "message": "Animal QR identity revoked successfully."})
+
+
+@app.get("/api/animals/lookup-qr")
+@auth_required()
+def lookup_animal_qr():
+    raw_query = (request.args.get("token") or request.args.get("code") or request.args.get("payload") or "").strip()
+    if not raw_query:
+        return jsonify({"error": "Missing token or code parameter"}), 400
+
+    token = raw_query
+    if token.startswith("PASHU:ANIMAL:"):
+        token = token[len("PASHU:ANIMAL:"):]
+
+    conn = get_db()
+    # Search by token or animal_code (manual fallback)
+    qr = conn.execute(
+        "SELECT a.*, q.qr_token, q.status as qr_status FROM animal_qr_codes q JOIN animals a ON a.id=q.animal_id WHERE q.qr_token=? AND q.status='ACTIVE'",
+        (token,)
+    ).fetchone()
+
+    if not qr:
+        # Manual fallback by animal_code
+        qr = conn.execute("SELECT * FROM animals WHERE UPPER(animal_code)=UPPER(?)", (token,)).fetchone()
+
+    if not qr:
+        conn.close()
+        return jsonify({"error": f"No active animal record matched query: '{raw_query}'"}), 404
+
+    animal_id = qr["id"]
+    conn.close()
+    # Delegate to standard get_animal for full rich record
+    return get_animal(animal_id)
+
+
+@app.post("/api/qr/decode")
+@auth_required()
+def decode_qr():
+    """Decode a QR image provided as Base64 payload using OpenCV.
+
+    Hardened per GuDApps 4.5 upload security + 4.4 validation:
+      * JSON body must be an object, image must be a string.
+      * Base64 length capped (approx 7 MB -> 5 MB binary).
+      * Decoded bytes size <= UPLOAD_MAX_BYTES.
+      * Magic-byte sniff must be an allowed image (jpeg/png/webp/gif).
+      * Rate limited per user/IP to avoid abuse.
+    """
+    data = request.get_json(force=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Expected a JSON object"}), 400
+    img_b64 = data.get("image")
+    if not img_b64 or not isinstance(img_b64, str):
+        return jsonify({"error": "Missing image data"}), 400
+    img_b64 = img_b64.strip()
+    if not img_b64:
+        return jsonify({"error": "Missing image data"}), 400
+    # Approx size check on the base64 string itself (5 MB binary ~ 6.7 MB b64)
+    if len(img_b64) > 7 * 1024 * 1024:
+        return jsonify({"error": "Image is too large"}), 413
+    # Strip data URI prefix if present
+    raw_b64 = img_b64
+    if "," in raw_b64:
+        raw_b64 = raw_b64.split(",", 1)[1]
+    raw_b64 = raw_b64.strip()
+    if len(raw_b64) > 7 * 1024 * 1024:
+        return jsonify({"error": "Image is too large"}), 413
+    try:
+        img_bytes = base64.b64decode(raw_b64, validate=True)
+    except Exception:
+        return jsonify({"error": "Invalid image data"}), 400
+    # Use centralized validator (includes size, magic-byte, malware-scan hook, storage-outside-web-root doc)
+    try:
+        import compliance_security as _cs
+        ok, reason, mime = _cs.validate_image_bytes(img_bytes)
+        if not ok:
+            # Map reason to appropriate status
+            if "larger" in (reason or "").lower():
+                return jsonify({"error": reason}), 413
+            if "empty" in (reason or "").lower():
+                return jsonify({"error": reason}), 400
+            if "JPEG, PNG" in (reason or "") or "must be" in (reason or "").lower():
+                return jsonify({"error": reason}), 415
+            if "malware" in (reason or "").lower() or "flagged" in (reason or "").lower() or "scanned" in (reason or "").lower():
+                return jsonify({"error": reason}), 422
+            return jsonify({"error": reason}), 415
+    except Exception:
+        # Fallback to original checks if compliance_security not available
+        max_bytes = 5 * 1024 * 1024
+        if len(img_bytes) == 0:
+            return jsonify({"error": "Image is empty"}), 400
+        if len(img_bytes) > max_bytes:
+            return jsonify({"error": f"Image is larger than the {max_bytes // (1024*1024)} MB limit"}), 413
+        header = img_bytes[:12]
+        is_image = header.startswith(b"\xff\xd8\xff") or header.startswith(b"\x89PNG\r\n\x1a\n") or (header.startswith(b"RIFF") and len(img_bytes) >= 12 and img_bytes[8:12] == b"WEBP") or header.startswith(b"GIF87a") or header.startswith(b"GIF89a")
+        if not is_image:
+            return jsonify({"error": "Image must be JPEG, PNG, WEBP or GIF"}), 415
+
+    val = decode_qr_image(img_b64)
+    if not val:
+        return jsonify({"decoded": False, "error": "No clear QR code detected in image"}), 422
+
+    qr_type = "unknown"
+    if val.startswith("PASHU:ANIMAL:"):
+        qr_type = "animal"
+    elif val.startswith("PASHU:SAMPLE:"):
+        qr_type = "sample"
+
+    return jsonify({"decoded": True, "payload": val, "type": qr_type})
+
+
+# --------------------------------- pregnancy & reproductive health endpoints --
+@app.get("/api/animals/<int:animal_id>/reproductive")
+@auth_required()
+def get_reproductive_records(animal_id):
+    conn = get_db()
+    records = conn.execute(
+        "SELECT r.*, u.full_name recorded_by_name FROM animal_reproductive_records r LEFT JOIN users u ON u.id=r.recorded_by "
+        "WHERE animal_id=? ORDER BY id DESC", (animal_id,)
+    ).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in records])
+
+
+@app.post("/api/animals/<int:animal_id>/reproductive")
+@auth_required(roles=["vet", "owner"])
+def add_reproductive_record(animal_id):
+    data = request.get_json(force=True) or {}
+    conn = get_db()
+    animal = conn.execute("SELECT * FROM animals WHERE id=?", (animal_id,)).fetchone()
+    if not animal:
+        conn.close()
+        return jsonify({"error": "Animal not found"}), 404
+
+    breeding_date = data.get("breeding_date") or data.get("mating_service_date")
+    expected_delivery = data.get("expected_delivery_date")
+    if breeding_date and not expected_delivery:
+        expected_delivery = calculate_expected_delivery(animal["species"], breeding_date)
+
+    status = data.get("pregnancy_status", "Suspected")
+    cur = conn.execute(
+        """
+        INSERT INTO animal_reproductive_records
+        (animal_id, pregnancy_status, breeding_date, mating_service_date, expected_delivery_date,
+         pregnancy_confirmation_date, previous_pregnancies, offspring_count, event_type,
+         miscarriage_abortion_notes, breeding_notes, recorded_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (animal_id, status, breeding_date, breeding_date, expected_delivery,
+         data.get("pregnancy_confirmation_date"), data.get("previous_pregnancies", 0),
+         data.get("offspring_count", 0), data.get("event_type", "Pregnancy Check"),
+         data.get("miscarriage_abortion_notes"), data.get("breeding_notes"), g.user["uid"])
+    )
+    rec_id = cur.lastrowid
+    audit_log(conn, "RECORD_REPRODUCTIVE_HEALTH", "animal", animal_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"],
+              details={"status": status, "breeding_date": breeding_date, "expected_delivery": expected_delivery})
+    conn.commit()
+    rec = conn.execute("SELECT * FROM animal_reproductive_records WHERE id=?", (rec_id,)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(rec)), 201
+
+
+# --------------------------------------- medication & allergy profile endpoints --
+@app.get("/api/animals/<int:animal_id>/allergies")
+@auth_required()
+def get_animal_allergies(animal_id):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT a.*, u.full_name recorded_by_name FROM animal_allergies a LEFT JOIN users u ON u.id=a.recorded_by "
+        "WHERE animal_id=? ORDER BY id DESC", (animal_id,)
+    ).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+@app.post("/api/animals/<int:animal_id>/allergies")
+@auth_required(roles=["vet"])
+def add_animal_allergy(animal_id):
+    data = request.get_json(force=True) or {}
+    allergen = (data.get("allergen") or "").strip()
+    reaction = (data.get("reaction") or "").strip()
+    if not allergen or not reaction:
+        return jsonify({"error": "Allergen and reaction description are required"}), 400
+
+    conn = get_db()
+    cur = conn.execute(
+        "INSERT INTO animal_allergies (animal_id, allergen, allergy_severity, reaction, date_recorded, recorded_by, status, notes) "
+        "VALUES (?,?,?,?,?,?,'Active',?)",
+        (animal_id, allergen, data.get("allergy_severity", "Moderate"), reaction,
+         data.get("date_recorded", str(date.today())), g.user["uid"], data.get("notes"))
+    )
+    allergy_id = cur.lastrowid
+    audit_log(conn, "RECORD_ALLERGY", "animal", animal_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"],
+              details={"allergen": allergen, "severity": data.get("allergy_severity")})
+    conn.commit()
+    al = conn.execute("SELECT * FROM animal_allergies WHERE id=?", (allergy_id,)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(al)), 201
+
+
+@app.get("/api/animals/<int:animal_id>/medications")
+@auth_required()
+def get_animal_medications(animal_id):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT m.*, u.full_name prescribed_by_name FROM animal_medications m LEFT JOIN users u ON u.id=m.prescribed_by "
+        "WHERE animal_id=? ORDER BY id DESC", (animal_id,)
+    ).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+# --------------------------------------------------------------- cases ---
+@app.post("/api/cases")
+@auth_required(roles=["owner"])
+def create_case():
+    data = request.get_json(force=True) or {}
+    v_errors = validation_service.validate_case(data)
+    if v_errors:
+        return jsonify({"error": "Validation failed", "fields": v_errors, "code": "VALIDATION_FAILED"}), 422
+    if not data.get("animal_id"):
+        return jsonify({"error": "animal_id is required"}), 400
+    conn = get_db()
+    animal = conn.execute("SELECT * FROM animals WHERE id=? AND owner_id=?", (data["animal_id"], g.user["uid"])).fetchone()
+    if not animal:
+        conn.close()
+        return jsonify({"error": "Animal not found"}), 404
+
+    source = data.get("reported_through", "Mobile App")
+    case = create_case_record(
+        conn,
+        animal=animal,
+        owner_id=g.user["uid"],
+        data=data,
+        source=source,
+        actor_name=g.user["name"],
+        actor_role=g.user["role"],
+        actor_id=g.user["uid"],
+        assigned_vet_id=data.get("vet_id") or None,
+    )
+    # Req 9: Auto-escalation via AI triage
+    _auto_escalate_case(conn, case)
+    conn.commit()
+    result = case_json(conn, case)
+    conn.close()
+    return jsonify(result), 201
+
+
+@app.post("/api/ivr/calls/inbound")
+@ivr_webhook_required
+def ivr_inbound_call():
+    data = request.get_json(force=True) or {}
+    conn = get_db()
+    try:
+        return jsonify(start_inbound_call(conn, data)), 201
+    except (ValueError, RuntimeError) as exc:
+        conn.rollback()
+        return jsonify({"error": str(exc)}), 400
+    finally:
+        conn.close()
+
+
+@app.post("/api/ivr/calls/<call_id>/input")
+@ivr_webhook_required
+def ivr_call_input(call_id):
+    data = request.get_json(force=True) or {}
+    conn = get_db()
+    try:
+        return jsonify(apply_call_input(conn, call_id, data))
+    except LookupError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        conn.rollback()
+        return jsonify({"error": str(exc)}), 400
+    finally:
+        conn.close()
+
+
+@app.post("/api/ivr/calls/<call_id>/events")
+@ivr_webhook_required
+def ivr_call_event(call_id):
+    data = request.get_json(force=True) or {}
+    conn = get_db()
+    try:
+        return jsonify(handle_call_event(conn, call_id, data))
+    except LookupError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except ValueError as exc:
+        conn.rollback()
+        return jsonify({"error": str(exc)}), 400
+    finally:
+        conn.close()
+
+
+@app.post("/api/ivr/report")
+@ivr_webhook_required
+def ivr_report():
+    """Backward-compatible completed-survey ingestion through the new IVR flow."""
+    data = request.get_json(force=True) or {}
+    if not (data.get("caller_number") or data.get("mobile")):
+        return jsonify({"error": "caller mobile is required"}), 400
+    conn = get_db()
+    try:
+        started = start_inbound_call(conn, {
+            "caller_number": data.get("caller_number") or data.get("mobile"),
+            "provider_call_id": data.get("provider_call_id"),
+        })
+        call_id = started["call_id"]
+        call = conn.execute("SELECT * FROM helpline_calls WHERE call_id=?", (call_id,)).fetchone()
+        language = call["language"] or (data.get("language") or "").lower()
+        if language not in SUPPORTED_LANGUAGES:
+            return jsonify({"error": "language is required for an unidentified-language caller"}), 400
+        district = call["district"] or data.get("district")
+        village = call["village"] or data.get("village")
+        if not district and not village:
+            return jsonify({"error": "district or village is required when region is unknown"}), 400
+
+        survey = json.loads(call["survey_data"] or "{}")
+        for field in (
+            "animal_id", "animal_name", "species", "breed", "age", "sex", "symptoms",
+            "duration", "severity", "affected_count", "vaccination_status",
+            "previous_treatment", "medicines_used", "farmer_observations",
+            "veterinarian_observations", "veterinarian_advice", "follow_up",
+            "additional_information", "urgency",
+        ):
+            if data.get(field) not in (None, ""):
+                survey[field] = data[field]
+        transcript = data.get("transcript") or ""
+        conn.execute(
+            """
+            UPDATE helpline_calls SET language=?, district=?, village=?, block=COALESCE(block, ?),
+              region_state=COALESCE(region_state, ?),
+              location_source=CASE WHEN location_source='UNKNOWN' THEN 'FARMER_PROVIDED' ELSE location_source END,
+              menu_option='2', status='SURVEY_COMPLETED', survey_data=?, transcript=?,
+              current_question=NULL, last_activity_at=datetime('now'), updated_at=datetime('now')
+            WHERE call_id=?
+            """,
+            (language, district, village, data.get("block"), data.get("state"),
+             json.dumps(survey, ensure_ascii=False), transcript, call_id),
+        )
+        conn.commit()
+        report = finalize_report(conn, call_id)
+        conn.execute(
+            "UPDATE helpline_calls SET status='COMPLETED', ended_at=datetime('now'), updated_at=datetime('now') WHERE call_id=?",
+            (call_id,),
+        )
+        conn.commit()
+        case = None
+        if report.get("case_id"):
+            row = conn.execute("SELECT * FROM cases WHERE id=?", (report["case_id"],)).fetchone()
+            case = case_json(conn, row)
+        return jsonify({"ok": True, "call_id": call_id, "report": report, "case": case}), 201
+    except (ValueError, RuntimeError) as exc:
+        conn.rollback()
+        return jsonify({"error": str(exc)}), 400
+    finally:
+        conn.close()
+
+
+@app.get("/api/ivr/reports")
+@auth_required(roles=["owner", "vet", "govt"])
+def ivr_reports():
+    conn = get_db()
+    try:
+        return jsonify(list_reports_for_user(conn, g.user["role"], g.user["uid"]))
+    finally:
+        conn.close()
+
+
+@app.get("/api/ivr/calls/<call_id>")
+@auth_required(roles=["owner", "vet", "govt"])
+def ivr_call_detail(call_id):
+    conn = get_db()
+    try:
+        return jsonify(get_call_for_user(conn, call_id, g.user["role"], g.user["uid"]))
+    except LookupError as exc:
+        return jsonify({"error": str(exc)}), 404
+    except PermissionError as exc:
+        return jsonify({"error": str(exc)}), 403
+    finally:
+        conn.close()
+
+
+@app.get("/api/ivr/analytics")
+@auth_required(roles=["govt", "vet"])
+def ivr_analytics():
+    conn = get_db()
+    try:
+        return jsonify(helpline_analytics(conn))
+    finally:
+        conn.close()
+
+
+@app.get("/api/vet/availability")
+@auth_required(roles=["vet", "govt"])
+def get_vet_availability():
+    conn = get_db()
+    try:
+        rows = list_vet_availability(conn)
+        if g.user["role"] == "vet":
+            rows = [row for row in rows if row["vet_id"] == g.user["uid"]]
+        return jsonify(rows)
+    finally:
+        conn.close()
+
+
+@app.put("/api/vet/availability")
+@auth_required(roles=["vet"])
+def update_vet_availability():
+    data = request.get_json(force=True) or {}
+    conn = get_db()
+    try:
+        return jsonify(set_vet_availability(
+            conn, g.user["uid"], data.get("status"), data.get("supported_languages")
+        ))
+    except ValueError as exc:
+        conn.rollback()
+        return jsonify({"error": str(exc)}), 400
+    finally:
+        conn.close()
+
+
+@app.get("/api/cases")
+@auth_required()
+def list_cases():
+    conn = get_db()
+    role = g.user["role"]
+    if role == "owner":
+        rows = conn.execute("SELECT * FROM cases WHERE owner_id=? ORDER BY id DESC", (g.user["uid"],)).fetchall()
+    elif role == "vet":
+        rows = conn.execute(
+            "SELECT * FROM cases WHERE vet_id=? OR vet_id IS NULL ORDER BY id DESC", (g.user["uid"],)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM cases ORDER BY id DESC").fetchall()
+    out = [case_json(conn, r) for r in rows]
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/cases/<int:case_id>")
+@auth_required()
+def get_case(case_id):
+    conn = get_db()
+    case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+    if not case:
+        conn.close()
+        return jsonify({"error": "Case not found"}), 404
+    if g.user["role"] == "owner" and case["owner_id"] != g.user["uid"]:
+        conn.close()
+        return jsonify({"error": "Not authorized"}), 403
+
+    result = case_json(conn, case)
+    updates = conn.execute("SELECT * FROM case_updates WHERE case_id=? ORDER BY id", (case_id,)).fetchall()
+    lab_requests = conn.execute("SELECT * FROM lab_requests WHERE case_id=? ORDER BY id DESC", (case_id,)).fetchall()
+    lab_reports = conn.execute("SELECT * FROM lab_reports WHERE case_id=? ORDER BY id DESC", (case_id,)).fetchall()
+    prescriptions = conn.execute("SELECT * FROM prescriptions WHERE case_id=? ORDER BY id DESC", (case_id,)).fetchall()
+
+    # Extended digital samples and treatment responses
+    samples = conn.execute("SELECT * FROM samples WHERE case_id=? ORDER BY id DESC", (case_id,)).fetchall()
+    samples_out = []
+    for s in samples:
+        sd = dict(s)
+        sd["qr_image"] = make_qr_image_data_url(s["qr_payload"])
+        custody = conn.execute("SELECT * FROM sample_custody_events WHERE sample_id=? ORDER BY id ASC", (s["id"],)).fetchall()
+        sd["custody"] = [dict(c) for c in custody]
+        samples_out.append(sd)
+
+    treatment_responses = conn.execute("SELECT * FROM treatment_responses WHERE case_id=? ORDER BY id DESC", (case_id,)).fetchall()
+    allergies = conn.execute("SELECT * FROM animal_allergies WHERE animal_id=? AND status='Active'", (case["animal_id"],)).fetchall()
+
+    result["updates"] = [row_to_dict(u) for u in updates]
+    result["lab_requests"] = [row_to_dict(l) for l in lab_requests]
+    result["lab_reports"] = [row_to_dict(l) for l in lab_reports]
+    result["prescriptions"] = [row_to_dict(p) for p in prescriptions]
+    result["samples"] = samples_out
+    result["treatment_responses"] = [row_to_dict(t) for t in treatment_responses]
+    result["animal_allergies"] = [row_to_dict(a) for a in allergies]
+
+    conn.close()
+    return jsonify(result)
+
+
+@app.put("/api/cases/<int:case_id>")
+@auth_required(roles=["vet"])
+def update_case(case_id):
+    data = request.get_json(force=True) or {}
+    conn = get_db()
+    case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+    if not case:
+        conn.close()
+        return jsonify({"error": "Case not found"}), 404
+
+    new_status = data.get("status") or case["status"]
+    diagnosis = data.get("diagnosis", case["diagnosis"])
+    treatment = data.get("treatment", case["treatment"])
+    note = data.get("note") or f"Status changed to {new_status}"
+
+    conn.execute(
+        "UPDATE cases SET status=?, diagnosis=?, treatment=?, vet_id=COALESCE(vet_id, ?), updated_at=datetime('now') WHERE id=?",
+        (new_status, diagnosis, treatment, g.user["uid"], case_id),
+    )
+    conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
+                 (case_id, new_status, note, g.user["name"]))
+
+    if new_status == "RECOVERED":
+        conn.execute("UPDATE animals SET status='Healthy' WHERE id=?", (case["animal_id"],))
+
+    notify(conn, case["owner_id"], f"Case {case['case_no']} updated: {new_status}", "case")
+    audit_log(conn, "UPDATE_CASE", "case", case_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"],
+              details={"status": new_status, "diagnosis": diagnosis})
+    conn.commit()
+    updated = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+    conn.close()
+    return jsonify(case_json(get_db(), updated))
+
+
+@app.delete("/api/cases/<int:case_id>")
+@auth_required(roles=["vet"])
+def delete_case(case_id):
+    conn = get_db()
+    try:
+        case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+        if not case:
+            return jsonify({"error": "Case not found"}), 404
+        if case["status"] not in ("RECOVERED", "CLOSED"):
+            return jsonify({"error": "Only RECOVERED or CLOSED reports can be deleted."}), 400
+
+        conn.execute("DELETE FROM case_updates WHERE case_id=?", (case_id,))
+        conn.execute("DELETE FROM lab_reports WHERE case_id=?", (case_id,))
+        conn.execute("DELETE FROM lab_requests WHERE case_id=?", (case_id,))
+        conn.execute("DELETE FROM prescriptions WHERE case_id=?", (case_id,))
+        conn.execute("DELETE FROM case_visits WHERE case_id=?", (case_id,))
+        conn.execute("DELETE FROM treatment_responses WHERE case_id=?", (case_id,))
+        conn.execute("DELETE FROM sample_custody_events WHERE sample_id IN (SELECT id FROM samples WHERE case_id=?)", (case_id,))
+        conn.execute("DELETE FROM samples WHERE case_id=?", (case_id,))
+        conn.execute("DELETE FROM cases WHERE id=?", (case_id,))
+        audit_log(conn, "DELETE_CASE", "case", case_id, actor_id=g.user["uid"],
+                  actor_name=g.user["name"], actor_role=g.user["role"],
+                  details={"case_no": case["case_no"]})
+        conn.commit()
+        return jsonify({"ok": True, "deleted": case["case_no"]})
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------ live visit tracking ---
+DISTRICT_CENTROIDS = {
+    "pune": (18.5204, 73.8567),
+    "satara": (17.6805, 74.0183),
+    "aurangabad": (19.8762, 75.3433),
+    "nagpur": (21.1458, 79.0882),
+    "nashik": (20.0110, 73.7903),
+    "nanded": (19.1383, 77.3210),
+    "latur": (18.4088, 76.5604),
+    "solapur": (17.6599, 75.9064),
+    "kolhapur": (16.7050, 74.2433),
+    "ahmednagar": (19.0952, 74.7496),
+}
+
+
+def fallback_coords(district):
+    d = (district or "").strip().lower()
+    return DISTRICT_CENTROIDS.get(d, (18.5204, 73.8567))
+
+
+@app.post("/api/cases/<int:case_id>/visit")
+@auth_required(roles=["vet"])
+def start_visit(case_id):
+    conn = get_db()
+    case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+    if not case:
+        conn.close()
+        return jsonify({"error": "Case not found"}), 404
+    animal = conn.execute("SELECT district FROM animals WHERE id=?", (case["animal_id"],)).fetchone()
+    to_lat, to_lng = fallback_coords(animal["district"] if animal else "")
+    data = request.get_json(silent=True) or {}
+    f_lat = data.get("from_lat", to_lat - 0.04)
+    f_lng = data.get("from_lng", to_lng - 0.035)
+    t_lat = data.get("to_lat", to_lat)
+    t_lng = data.get("to_lng", to_lng)
+    travel_seconds = int(data.get("travel_seconds", 240))
+
+    cur = conn.execute(
+        "INSERT INTO case_visits (case_id, vet_id, status, from_lat, from_lng, to_lat, to_lng, travel_seconds, started_at) "
+        "VALUES (?,?,?,?,?,?,?,?, datetime('now'))",
+        (case_id, g.user["uid"], "ON_THE_WAY", f_lat, f_lng, t_lat, t_lng, travel_seconds),
+    )
+    conn.execute("UPDATE cases SET status='UNDER INVESTIGATION', vet_id=? WHERE id=?", (g.user["uid"], case_id))
+    conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
+                 (case_id, "UNDER INVESTIGATION", "Veterinarian has started live field visit.", g.user["name"]))
+    notify(conn, case["owner_id"], f"Dr. {g.user['name']} is on the way to examine your animal for {case['case_no']}.", "case")
+    conn.commit()
+    visit = conn.execute("SELECT * FROM case_visits WHERE id=?", (cur.lastrowid,)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(visit)), 201
+
+
+@app.put("/api/cases/<int:case_id>/visit")
+@auth_required(roles=["vet"])
+def update_visit(case_id):
+    data = request.get_json(force=True) or {}
+    new_status = data.get("status")
+    if new_status not in ("ARRIVED", "COMPLETED", "ON_THE_WAY"):
+        return jsonify({"error": "Invalid status"}), 400
+    conn = get_db()
+    visit = conn.execute(
+        "SELECT * FROM case_visits WHERE case_id=? ORDER BY id DESC LIMIT 1", (case_id,)
+    ).fetchone()
+    if not visit:
+        conn.close()
+        return jsonify({"error": "No visit found for this case"}), 404
+
+    case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+    if new_status == "ARRIVED":
+        conn.execute("UPDATE case_visits SET status='ARRIVED', arrived_at=datetime('now') WHERE id=?", (visit["id"],))
+        conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
+                     (case_id, case["status"], "Veterinarian arrived at animal's location.", g.user["name"]))
+        notify(conn, case["owner_id"], f"Dr. {g.user['name']} has arrived at your farm for case {case['case_no']}.", "case")
+    elif new_status == "COMPLETED":
+        conn.execute("UPDATE case_visits SET status='COMPLETED', completed_at=datetime('now') WHERE id=?", (visit["id"],))
+        conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
+                     (case_id, case["status"], "Physical field visit completed.", g.user["name"]))
+    conn.commit()
+    v = conn.execute("SELECT * FROM case_visits WHERE id=?", (visit["id"],)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(v))
+
+
+@app.get("/api/cases/<int:case_id>/track")
+@auth_required()
+def track_visit(case_id):
+    conn = get_db()
+    visit = conn.execute(
+        "SELECT * FROM case_visits WHERE case_id=? ORDER BY id DESC LIMIT 1", (case_id,)
+    ).fetchone()
+    if not visit:
+        conn.close()
+        return jsonify({"visit": None})
+
+    vd = dict(visit)
+    started = datetime.strptime(vd["started_at"][:19], "%Y-%m-%d %H:%M:%S")
+    elapsed = max(0, (datetime.utcnow() - started).total_seconds())
+    dur = float(vd["travel_seconds"] or 240)
+    frac = min(1.0, elapsed / dur)
+
+    f_lat, f_lng = vd["from_lat"], vd["from_lng"]
+    t_lat, t_lng = vd["to_lat"], vd["to_lng"]
+
+    if vd["status"] == "ON_THE_WAY":
+        cur_lat = f_lat + (t_lat - f_lat) * frac
+        cur_lng = f_lng + (t_lng - f_lng) * frac
+        if frac >= 1.0 and not vd["arrived_at"]:
+            conn.execute("UPDATE case_visits SET status='ARRIVED', arrived_at=datetime('now') WHERE id=?", (vd["id"],))
+            conn.commit()
+            vd["status"] = "ARRIVED"
+    else:
+        cur_lat, cur_lng = t_lat, t_lng
+
+    eta_seconds = max(0, int(dur - elapsed)) if vd["status"] == "ON_THE_WAY" else 0
+    vet = conn.execute("SELECT full_name, mobile, specialization FROM users WHERE id=?", (vd["vet_id"],)).fetchone()
+    conn.close()
+
+    return jsonify({
+        "visit": vd,
+        "vet": row_to_dict(vet),
+        "current_position": {"lat": round(cur_lat, 6), "lng": round(cur_lng, 6)},
+        "destination": {"lat": t_lat, "lng": t_lng},
+        "origin": {"lat": f_lat, "lng": f_lng},
+        "progress_fraction": round(frac, 3),
+        "eta_seconds": eta_seconds,
+    })
+
+
+@app.get("/api/vet/reports")
+@auth_required(roles=["vet"])
+def vet_reports():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM cases ORDER BY id DESC").fetchall()
+    out = [case_json(conn, r) for r in rows]
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/vets")
+@auth_required()
+def list_vets():
+    conn = get_db()
+    district = request.args.get("district")
+    if district:
+        vets = conn.execute(
+            "SELECT id, full_name, mobile, email, specialization, village, block, district FROM users "
+            "WHERE role='vet' AND district=?", (district,)
+        ).fetchall()
+    else:
+        vets = conn.execute(
+            "SELECT id, full_name, mobile, email, specialization, village, block, district FROM users WHERE role='vet'"
+        ).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(v) for v in vets])
+
+
+@app.get("/api/vet/search")
+@auth_required(roles=["vet", "govt"])
+def vet_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"animals": [], "herds": []})
+    conn = get_db()
+    animals = conn.execute(
+        "SELECT * FROM animals WHERE animal_code LIKE ? OR mobile LIKE ? OR owner_name LIKE ? OR animal_name LIKE ?",
+        (f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%"),
+    ).fetchall()
+    herds = conn.execute("SELECT * FROM herds WHERE herd_code LIKE ?", (f"%{q}%",)).fetchall()
+    conn.close()
+    return jsonify({"animals": [row_to_dict(a) for a in animals], "herds": [row_to_dict(h) for h in herds]})
+
+
+# ----------------------------------- digital sample & transport tracking -----
+@app.post("/api/samples")
+@auth_required(roles=["vet", "owner", "lab"])
+def create_sample():
+    """Create a digital laboratory specimen with unique Sample QR, GPS and timestamp."""
+    data = request.get_json(force=True) or {}
+    v_errors = validation_service.validate_sample(data)
+    if v_errors:
+        return jsonify({"error": "Validation failed", "fields": v_errors, "code": "VALIDATION_FAILED"}), 422
+    case_id = data.get("case_id")
+    sample_type = data.get("sample_type", "Blood Sample")
+
+    conn = get_db()
+    case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+    if not case:
+        conn.close()
+        return jsonify({"error": "Invalid case ID"}), 404
+
+    animal = conn.execute("SELECT * FROM animals WHERE id=?", (case["animal_id"],)).fetchone()
+    district = animal["district"] or "PUN"
+    sample_code = next_code(conn, "SMP", "samples", "sample_code", district=district[:3].upper())
+    qr_token = f"sqr_{uuid.uuid4().hex}"
+    qr_payload = f"PASHU:SAMPLE:{qr_token}"
+
+    lat = data.get("collection_lat")
+    lng = data.get("collection_lng")
+    is_manual = int(data.get("is_manual_location", 0))
+
+    if lat is None or lng is None:
+        c_lat, c_lng = fallback_coords(district)
+        lat, lng = c_lat, c_lng
+        is_manual = 1
+
+    cur = conn.execute(
+        """
+        INSERT INTO samples
+        (sample_code, qr_token, qr_payload, animal_id, case_id, lab_request_id,
+         sample_type, status, collector_id, collection_lat, collection_lng,
+         is_manual_location, collection_notes, transporter_name, transporter_phone, collected_at)
+        VALUES (?,?,?,?,?,?,?,'COLLECTED',?,?,?,?,?,?,?,datetime('now'))
+        """,
+        (sample_code, qr_token, qr_payload, case["animal_id"], case["id"],
+         data.get("lab_request_id"), sample_type, g.user["uid"],
+         lat, lng, is_manual, data.get("collection_notes"),
+         data.get("transporter_name"), data.get("transporter_phone"))
+    )
+    sample_id = cur.lastrowid
+
+    # Record first custody event
+    conn.execute(
+        """
+        INSERT INTO sample_custody_events
+        (sample_id, status, action, actor_id, actor_name, actor_role, lat, lng, is_manual_location, notes)
+        VALUES (?, 'COLLECTED', 'Biological specimen collected', ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (sample_id, g.user["uid"], g.user["name"], g.user["role"], lat, lng, is_manual,
+         f"Sample type: {sample_type}. Notes: {data.get('collection_notes', 'Standard collection')}")
+    )
+
+    conn.execute("UPDATE cases SET status='SAMPLE COLLECTED', updated_at=datetime('now') WHERE id=?", (case["id"],))
+    conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
+                 (case["id"], "SAMPLE COLLECTED", f"Sample {sample_code} ({sample_type}) collected.", g.user["name"]))
+
+    audit_log(conn, "CREATE_SAMPLE", "sample", sample_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"],
+              details={"sample_code": sample_code, "qr_token": qr_token, "sample_type": sample_type})
+    conn.commit()
+
+    sample = conn.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
+    res = row_to_dict(sample)
+    res["qr_image"] = make_qr_image_data_url(qr_payload)
+    conn.close()
+    return jsonify(res), 201
+
+
+@app.get("/api/samples")
+@auth_required()
+def list_samples():
+    conn = get_db()
+    case_id = request.args.get("case_id")
+    status = request.args.get("status")
+
+    query = "SELECT s.*, a.animal_code, a.species, c.case_no FROM samples s JOIN animals a ON a.id=s.animal_id JOIN cases c ON c.id=s.case_id WHERE 1=1"
+    params = []
+    if case_id:
+        query += " AND s.case_id=?"
+        params.append(case_id)
+    if status:
+        query += " AND s.status=?"
+        params.append(status)
+    query += " ORDER BY s.id DESC"
+
+    rows = conn.execute(query, params).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["qr_image"] = make_qr_image_data_url(d["qr_payload"])
+        out.append(d)
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/samples/<int:sample_id>")
+@auth_required()
+def get_sample_detail(sample_id):
+    conn = get_db()
+    sample = conn.execute(
+        "SELECT s.*, a.animal_code, a.species, a.breed, c.case_no FROM samples s "
+        "JOIN animals a ON a.id=s.animal_id JOIN cases c ON c.id=s.case_id WHERE s.id=?",
+        (sample_id,)
+    ).fetchone()
+    if not sample:
+        conn.close()
+        return jsonify({"error": "Sample not found"}), 404
+
+    events = conn.execute(
+        "SELECT * FROM sample_custody_events WHERE sample_id=? ORDER BY id ASC", (sample_id,)
+    ).fetchall()
+    conn.close()
+
+    res = dict(sample)
+    res["qr_image"] = make_qr_image_data_url(res["qr_payload"])
+    res["custody_events"] = [dict(e) for e in events]
+    return jsonify(res)
+
+
+@app.get("/api/samples/lookup-qr")
+@auth_required()
+def lookup_sample_qr():
+    raw = (request.args.get("token") or request.args.get("code") or request.args.get("payload") or "").strip()
+    if not raw:
+        return jsonify({"error": "Missing token or code parameter"}), 400
+
+    token = raw
+    if token.startswith("PASHU:SAMPLE:"):
+        token = token[len("PASHU:SAMPLE:"):]
+
+    conn = get_db()
+    sample = conn.execute("SELECT id FROM samples WHERE qr_token=?", (token,)).fetchone()
+    if not sample:
+        sample = conn.execute("SELECT id FROM samples WHERE UPPER(sample_code)=UPPER(?)", (token,)).fetchone()
+
+    if not sample:
+        conn.close()
+        return jsonify({"error": f"No sample matched identifier: '{raw}'"}), 404
+
+    sid = sample["id"]
+    conn.close()
+    return get_sample_detail(sid)
+
+
+@app.post("/api/samples/<int:sample_id>/transport")
+@auth_required(roles=["vet", "lab", "govt"])
+def update_sample_transport(sample_id):
+    """Advance sample transport lifecycle status and record chain of custody."""
+    data = request.get_json(force=True) or {}
+    new_status = data.get("status")
+    if new_status not in SAMPLE_STATUSES:
+        return jsonify({"error": f"Invalid sample status. Must be one of: {', '.join(SAMPLE_STATUSES)}"}), 400
+
+    conn = get_db()
+    sample = conn.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not sample:
+        conn.close()
+        return jsonify({"error": "Sample not found"}), 404
+
+    t_name = data.get("transporter_name") or sample["transporter_name"]
+    t_phone = data.get("transporter_phone") or sample["transporter_phone"]
+    notes = data.get("notes") or f"Transport status moved to {new_status}"
+    lat = data.get("lat")
+    lng = data.get("lng")
+
+    conn.execute(
+        "UPDATE samples SET status=?, transporter_name=?, transporter_phone=?, updated_at=datetime('now') WHERE id=?",
+        (new_status, t_name, t_phone, sample_id)
+    )
+
+    action_label = {
+        "READY_FOR_PICKUP": "Marked ready for cold-chain transport",
+        "PICKED_UP": f"Courier collected package (Transporter: {t_name})",
+        "IN_TRANSIT": "Package in transit to regional testing laboratory",
+        "ARRIVED_AT_LAB": "Courier delivered package at lab intake dock",
+    }.get(new_status, f"Transport updated to {new_status}")
+
+    conn.execute(
+        """
+        INSERT INTO sample_custody_events
+        (sample_id, status, action, actor_id, actor_name, actor_role, lat, lng, notes)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        (sample_id, new_status, action_label, g.user["uid"], g.user["name"], g.user["role"], lat, lng, notes)
+    )
+
+    audit_log(conn, "SAMPLE_TRANSPORT_UPDATE", "sample", sample_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"],
+              details={"status": new_status, "transporter": t_name})
+    conn.commit()
+    conn.close()
+    return get_sample_detail(sample_id)
+
+
+# --------------------------------------------- laboratory workflow endpoints --
+@app.get("/api/lab/summary")
+@auth_required(roles=["lab", "vet", "govt"])
+def get_lab_summary():
+    conn = get_db()
+    pending = conn.execute(
+        "SELECT COUNT(*) c FROM samples WHERE status IN ('COLLECTED','READY_FOR_PICKUP','PICKED_UP','IN_TRANSIT','ARRIVED_AT_LAB')"
+    ).fetchone()["c"]
+    in_testing = conn.execute(
+        "SELECT COUNT(*) c FROM samples WHERE status IN ('LAB_RECEIVED','TESTING','RESULT_READY')"
+    ).fetchone()["c"]
+    completed_today = conn.execute(
+        "SELECT COUNT(*) c FROM samples WHERE status='COMPLETED' AND updated_at >= date('now')"
+    ).fetchone()["c"]
+    rejected = conn.execute("SELECT COUNT(*) c FROM samples WHERE status='REJECTED'").fetchone()["c"]
+    conn.close()
+    return jsonify({
+        "pending_receiving": pending,
+        "in_testing": in_testing,
+        "completed_today": completed_today,
+        "rejected_samples": rejected,
+    })
+
+
+@app.get("/api/lab/queue")
+@auth_required(roles=["lab", "vet", "govt"])
+def get_lab_queue():
+    conn = get_db()
+    samples = conn.execute(
+        """
+        SELECT s.*, a.animal_code, a.species, c.case_no, c.disease_suspected,
+               u.full_name collector_name
+        FROM samples s
+        JOIN animals a ON a.id=s.animal_id
+        JOIN cases c ON c.id=s.case_id
+        LEFT JOIN users u ON u.id=s.collector_id
+        ORDER BY s.id DESC
+        """
+    ).fetchall()
+    conn.close()
+
+    out = []
+    for s in samples:
+        d = dict(s)
+        d["qr_image"] = make_qr_image_data_url(d["qr_payload"])
+        out.append(d)
+    return jsonify(out)
+
+
+@app.post("/api/samples/<int:sample_id>/receive")
+@auth_required(roles=["lab", "vet"])
+def receive_sample(sample_id):
+    """Lab receiving workflow: accept (LAB_RECEIVED) or reject with reason."""
+    data = request.get_json(force=True) or {}
+    action = data.get("action", "accept").lower()
+    notes = data.get("notes") or ""
+    rejection_reason = (data.get("rejection_reason") or "").strip()
+
+    conn = get_db()
+    sample = conn.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not sample:
+        conn.close()
+        return jsonify({"error": "Sample not found"}), 404
+
+    case = conn.execute("SELECT * FROM cases WHERE id=?", (sample["case_id"],)).fetchone()
+    animal = conn.execute("SELECT * FROM animals WHERE id=?", (sample["animal_id"],)).fetchone()
+
+    if action == "reject":
+        if not rejection_reason:
+            conn.close()
+            return jsonify({"error": "Rejection reason is required when rejecting a sample."}), 400
+
+        conn.execute(
+            "UPDATE samples SET status='REJECTED', rejection_reason=?, updated_at=datetime('now') WHERE id=?",
+            (rejection_reason, sample_id)
+        )
+        conn.execute(
+            """
+            INSERT INTO sample_custody_events (sample_id, status, action, actor_id, actor_name, actor_role, notes)
+            VALUES (?, 'REJECTED', 'Specimen rejected by laboratory', ?, ?, ?, ?)
+            """,
+            (sample_id, g.user["uid"], g.user["name"], g.user["role"], f"Rejection reason: {rejection_reason}. Notes: {notes}")
+        )
+        # Notify vet and owner
+        if case["vet_id"]:
+            notify(conn, case["vet_id"], f"⚠️ Lab sample {sample['sample_code']} REJECTED: {rejection_reason}", "lab")
+        notify(conn, case["owner_id"], f"Lab sample for animal {animal['animal_code']} could not be processed: {rejection_reason}", "lab")
+
+        audit_log(conn, "REJECT_SAMPLE", "sample", sample_id, actor_id=g.user["uid"],
+                  actor_name=g.user["name"], actor_role=g.user["role"],
+                  details={"reason": rejection_reason})
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "status": "REJECTED", "reason": rejection_reason})
+
+    else:
+        # Accept
+        conn.execute("UPDATE samples SET status='LAB_RECEIVED', updated_at=datetime('now') WHERE id=?", (sample_id,))
+        conn.execute(
+            """
+            INSERT INTO sample_custody_events (sample_id, status, action, actor_id, actor_name, actor_role, notes)
+            VALUES (?, 'LAB_RECEIVED', 'Sample inspected and accepted for diagnostic processing', ?, ?, ?, ?)
+            """,
+            (sample_id, g.user["uid"], g.user["name"], g.user["role"], notes or "Seal intact, cold-chain temperature confirmed.")
+        )
+        if case["vet_id"]:
+            notify(conn, case["vet_id"], f"Lab has received sample {sample['sample_code']} for testing.", "lab")
+
+        audit_log(conn, "ACCEPT_SAMPLE", "sample", sample_id, actor_id=g.user["uid"],
+                  actor_name=g.user["name"], actor_role=g.user["role"])
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "status": "LAB_RECEIVED"})
+
+
+@app.post("/api/samples/<int:sample_id>/test")
+@auth_required(roles=["lab", "vet"])
+def start_sample_testing(sample_id):
+    conn = get_db()
+    conn.execute("UPDATE samples SET status='TESTING', updated_at=datetime('now') WHERE id=?", (sample_id,))
+    conn.execute(
+        """
+        INSERT INTO sample_custody_events (sample_id, status, action, actor_id, actor_name, actor_role, notes)
+        VALUES (?, 'TESTING', 'Diagnostic test procedures in progress', ?, ?, ?, 'Assigned to analytical bench')
+        """,
+        (sample_id, g.user["uid"], g.user["name"], g.user["role"])
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "status": "TESTING"})
+
+
+@app.post("/api/samples/<int:sample_id>/results")
+@auth_required(roles=["lab", "vet"])
+def submit_sample_results(sample_id):
+    """Structured result entry for diagnostic testing."""
+    data = request.get_json(force=True) or {}
+    test_name = (data.get("test_name") or "Diagnostic Test").strip()
+    result_val = (data.get("result") or "PENDING").strip()
+
+    conn = get_db()
+    sample = conn.execute("SELECT * FROM samples WHERE id=?", (sample_id,)).fetchone()
+    if not sample:
+        conn.close()
+        return jsonify({"error": "Sample not found"}), 404
+
+    case = conn.execute("SELECT * FROM cases WHERE id=?", (sample["case_id"],)).fetchone()
+    report_no = next_code(conn, "LAB", "lab_reports", "report_no")
+
+    cur = conn.execute(
+        """
+        INSERT INTO lab_reports
+        (report_no, lab_request_id, case_id, animal_id, herd_id, sample, sample_id,
+         test_name, test_type, test_method, result, quantitative_result, units,
+         reference_range_min, reference_range_max, reference_range_text,
+         abnormal_flag, technician_name, verification_status, comments, test_date, entered_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'UNVERIFIED',?,date('now'),?)
+        """,
+        (report_no, sample["lab_request_id"], case["id"], case["animal_id"], case["herd_id"],
+         sample["sample_type"], sample_id, test_name, data.get("test_type", "Serology"),
+         data.get("test_method", "ELISA"), result_val, data.get("quantitative_result"),
+         data.get("units"), data.get("reference_range_min"), data.get("reference_range_max"),
+         data.get("reference_range_text"), data.get("abnormal_flag", "Normal"),
+         data.get("technician_name", g.user["name"]), data.get("comments"), g.user["uid"])
+    )
+    rep_id = cur.lastrowid
+    conn.execute("UPDATE samples SET status='RESULT_READY', updated_at=datetime('now') WHERE id=?", (sample_id,))
+    conn.execute(
+        """
+        INSERT INTO sample_custody_events (sample_id, status, action, actor_id, actor_name, actor_role, notes)
+        VALUES (?, 'RESULT_READY', 'Diagnostic result entered awaiting verification', ?, ?, ?, ?)
+        """,
+        (sample_id, g.user["uid"], g.user["name"], g.user["role"], f"Report {report_no}: {test_name} = {result_val}")
+    )
+    conn.commit()
+    rep = conn.execute("SELECT * FROM lab_reports WHERE id=?", (rep_id,)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(rep)), 201
+
+
+@app.post("/api/lab/reports/<int:report_id>/verify")
+@auth_required(roles=["lab", "vet"])
+def verify_lab_report(report_id):
+    """Verify and publish laboratory report — automatically triggers vet notification (Feature Group 10)."""
+    conn = get_db()
+    rep = conn.execute("SELECT * FROM lab_reports WHERE id=?", (report_id,)).fetchone()
+    if not rep:
+        conn.close()
+        return jsonify({"error": "Lab report not found"}), 404
+
+    case = conn.execute("SELECT * FROM cases WHERE id=?", (rep["case_id"],)).fetchone()
+    animal = conn.execute("SELECT * FROM animals WHERE id=?", (rep["animal_id"],)).fetchone()
+
+    conn.execute(
+        """
+        UPDATE lab_reports
+        SET verification_status='VERIFIED', verified_by=?, verified_at=datetime('now'), published_at=datetime('now')
+        WHERE id=?
+        """,
+        (g.user["uid"], report_id)
+    )
+
+    if rep["sample_id"]:
+        conn.execute("UPDATE samples SET status='COMPLETED', updated_at=datetime('now') WHERE id=?", (rep["sample_id"],))
+        conn.execute(
+            """
+            INSERT INTO sample_custody_events (sample_id, status, action, actor_id, actor_name, actor_role, notes)
+            VALUES (?, 'COMPLETED', 'Diagnostic report verified and released', ?, ?, ?, ?)
+            """,
+            (rep["sample_id"], g.user["uid"], g.user["name"], g.user["role"], f"Report {rep['report_no']} verified by {g.user['name']}")
+        )
+
+    # FEATURE GROUP 10: AUTOMATIC NOTIFICATIONS
+    # 1. Notify Veterinarian
+    if case["vet_id"]:
+        vet_msg = f"🧪 Verified Lab Report {rep['report_no']} is ready for Case {case['case_no']} (Animal {animal['animal_code']}, Test: {rep['test_name']}, Result: {rep['result']})."
+        notify(conn, case["vet_id"], vet_msg, "lab")
+
+    # 2. Notify Owner
+    owner_msg = f"🧪 Laboratory report {rep['report_no']} for your animal {animal['animal_code']} (Case {case['case_no']}) has been released."
+    notify(conn, case["owner_id"], owner_msg, "lab")
+
+    # Audit logging
+    audit_log(conn, "VERIFY_LAB_REPORT", "lab_report", report_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"],
+              details={"report_no": rep["report_no"], "result": rep["result"], "test_name": rep["test_name"]})
+
+    conn.commit()
+    updated = conn.execute("SELECT * FROM lab_reports WHERE id=?", (report_id,)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(updated))
+
+
+# ------------------------------------------------------------ lab tests --
+@app.post("/api/lab/requests")
+@auth_required(roles=["vet", "lab"])
+def create_lab_request():
+    data = request.get_json(force=True) or {}
+    conn = get_db()
+    case = conn.execute("SELECT * FROM cases WHERE id=?", (data.get("case_id"),)).fetchone()
+    if not case:
+        conn.close()
+        return jsonify({"error": "Invalid case ID"}), 404
+    cur = conn.execute(
+        "INSERT INTO lab_requests (case_id, animal_id, herd_id, sample_type, test_requested, priority, notes, status, requested_by) "
+        "VALUES (?,?,?,?,?,?,?,'REQUESTED',?)",
+        (case["id"], case["animal_id"], case["herd_id"], data.get("sample_type"), data.get("test_requested"),
+         data.get("priority", "Normal"), data.get("notes"), g.user["uid"]),
+    )
+    conn.execute("UPDATE cases SET status='LAB PENDING', updated_at=datetime('now') WHERE id=?", (case["id"],))
+    conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
+                 (case["id"], "LAB PENDING", f"Lab test requested: {data.get('test_requested')}", g.user["name"]))
+    notify(conn, case["owner_id"], f"A laboratory test has been requested for case {case['case_no']}.", "lab")
+    conn.commit()
+    req = conn.execute("SELECT * FROM lab_requests WHERE id=?", (cur.lastrowid,)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(req)), 201
+
+
+@app.get("/api/lab/reports")
+@auth_required()
+def list_lab_reports():
+    conn = get_db()
+    if g.user["role"] == "owner":
+        rows = conn.execute(
+            "SELECT l.*, a.animal_code, a.animal_name, c.case_no FROM lab_reports l "
+            "JOIN animals a ON a.id=l.animal_id JOIN cases c ON c.id=l.case_id "
+            "WHERE a.owner_id=? ORDER BY l.id DESC", (g.user["uid"],)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT l.*, a.animal_code, a.animal_name, c.case_no FROM lab_reports l "
+            "JOIN animals a ON a.id=l.animal_id JOIN cases c ON c.id=l.case_id "
+            "ORDER BY l.id DESC"
+        ).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+@app.post("/api/lab/reports")
+@auth_required(roles=["vet", "lab"])
+def create_lab_report():
+    data = request.get_json(force=True) or {}
+    conn = get_db()
+    case = conn.execute("SELECT * FROM cases WHERE id=?", (data.get("case_id"),)).fetchone()
+    if not case:
+        conn.close()
+        return jsonify({"error": "Invalid case ID"}), 404
+
+    animal = conn.execute("SELECT * FROM animals WHERE id=?", (case["animal_id"],)).fetchone()
+    report_no = next_code(conn, "LAB", "lab_reports", "report_no")
+    cur = conn.execute(
+        """
+        INSERT INTO lab_reports
+        (report_no, lab_request_id, case_id, animal_id, herd_id, sample, sample_id,
+         test_name, test_type, test_method, result, quantitative_result, units,
+         reference_range_min, reference_range_max, reference_range_text,
+         abnormal_flag, technician_name, verification_status, comments, test_date, notes, entered_by)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'VERIFIED',?,?,?,?)
+        """,
+        (report_no, data.get("lab_request_id"), case["id"], case["animal_id"], case["herd_id"],
+         data.get("sample"), data.get("sample_id"), data.get("test_name"),
+         data.get("test_type", "Diagnostic"), data.get("test_method", "Standard"),
+         data.get("result"), data.get("quantitative_result"), data.get("units"),
+         data.get("reference_range_min"), data.get("reference_range_max"),
+         data.get("reference_range_text"), data.get("abnormal_flag", "Normal"),
+         g.user["name"], data.get("comments"), data.get("test_date", str(date.today())),
+         data.get("notes"), g.user["uid"]),
+    )
+    rep_id = cur.lastrowid
+    if data.get("lab_request_id"):
+        conn.execute("UPDATE lab_requests SET status='REPORT READY' WHERE id=?", (data["lab_request_id"],))
+
+    conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
+                 (case["id"], case["status"], f"Lab report {report_no} entered: {data.get('test_name')} = {data.get('result')}", g.user["name"]))
+
+    # Automatic Notifications
+    notify(conn, case["owner_id"], f"Your lab report {report_no} is ready for case {case['case_no']}.", "lab")
+    if case["vet_id"] and case["vet_id"] != g.user["uid"]:
+        notify(conn, case["vet_id"], f"Lab report {report_no} ready for case {case['case_no']} (Animal {animal['animal_code']}).", "lab")
+
+    audit_log(conn, "CREATE_LAB_REPORT", "lab_report", rep_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"],
+              details={"report_no": report_no, "test_name": data.get("test_name"), "result": data.get("result")})
+
+    conn.commit()
+    rep = conn.execute("SELECT * FROM lab_reports WHERE id=?", (rep_id,)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(rep)), 201
+
+
+# --------------------------------------------------------- prescriptions --
+@app.post("/api/prescriptions")
+@auth_required(roles=["vet"])
+def create_prescription():
+    """Prescription issuance with strict allergy conflict verification and authorized override."""
+    data = request.get_json(force=True) or {}
+    conn = get_db()
+    try:
+        case = conn.execute("SELECT * FROM cases WHERE id=?", (data.get("case_id"),)).fetchone()
+        if not case:
+            return jsonify({"error": "Invalid case ID"}), 404
+
+        animal = conn.execute("SELECT * FROM animals WHERE id=?", (case["animal_id"],)).fetchone()
+        medicine = (data.get("medicine") or "").strip()
+
+        # FEATURE GROUP 3: ALLERGY CONFLICT CHECKING
+        active_allergies = conn.execute(
+            "SELECT * FROM animal_allergies WHERE animal_id=? AND status='Active'",
+            (case["animal_id"],)
+        ).fetchall()
+        conflict = check_allergy_conflict(medicine, [dict(a) for a in active_allergies])
+
+        override = bool(data.get("override") or data.get("allergy_override"))
+        override_reason = (data.get("override_reason") or "").strip()
+
+        if conflict and not override:
+            return jsonify({
+                "error": f"⚠️ CONTRAINDICATION ALERT: Animal {animal['animal_code']} has a documented {conflict['allergy_severity']} allergy to '{conflict['allergen']}' (Reaction: {conflict['reaction']}). Prescription halted.",
+                "conflict": True,
+                "allergen": conflict["allergen"],
+                "severity": conflict["allergy_severity"],
+                "reaction": conflict["reaction"],
+                "requires_override": True,
+            }), 409
+
+        cur = conn.execute(
+            """
+            INSERT INTO prescriptions
+            (case_id, animal_id, herd_id, diagnosis, medicine, dosage, frequency,
+             duration, instructions, follow_up_date, allergy_override, override_reason, vet_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (case["id"], case["animal_id"], case["herd_id"], data.get("diagnosis"), medicine,
+             data.get("dosage"), data.get("frequency"), data.get("duration"), data.get("instructions"),
+             data.get("follow_up_date"), int(override), override_reason if override else None, g.user["uid"]),
+        )
+        presc_id = cur.lastrowid
+
+        # Add to animal medications history
+        conn.execute(
+            """
+            INSERT INTO animal_medications
+            (animal_id, case_id, prescription_id, medication_name, dosage, frequency,
+             start_date, end_date, status, prescribed_by, allergy_override, override_reason, notes)
+            VALUES (?,?,?,?,?,?,date('now'),?,'Active',?,?,?,?)
+            """,
+            (case["animal_id"], case["id"], presc_id, medicine, data.get("dosage"),
+             data.get("frequency"), data.get("follow_up_date"), g.user["uid"],
+             int(override), override_reason if override else None, data.get("instructions", ""))
+        )
+
+        conn.execute("UPDATE cases SET status='TREATMENT', diagnosis=COALESCE(?, diagnosis), updated_at=datetime('now') WHERE id=?",
+                     (data.get("diagnosis"), case["id"]))
+        note_txt = f"E-prescription issued: {medicine}"
+        if override:
+            note_txt += f" (Allergy override granted: {override_reason})"
+
+        conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?,?,?,?)",
+                     (case["id"], "TREATMENT", note_txt, g.user["name"]))
+        notify(conn, case["owner_id"], f"An e-prescription is available for case {case['case_no']}.", "prescription")
+
+        audit_log(conn, "ISSUE_PRESCRIPTION" if not override else "ALLERGY_OVERRIDE_PRESCRIBED",
+                  "prescription", presc_id, actor_id=g.user["uid"],
+                  actor_name=g.user["name"], actor_role=g.user["role"],
+                  details={"medicine": medicine, "override": override, "override_reason": override_reason})
+
+        conn.commit()
+        presc = conn.execute("SELECT * FROM prescriptions WHERE id=?", (presc_id,)).fetchone()
+        return jsonify(row_to_dict(presc)), 201
+    finally:
+        conn.close()
+
+
+@app.get("/api/prescriptions")
+@auth_required()
+def list_prescriptions():
+    conn = get_db()
+    if g.user["role"] == "owner":
+        rows = conn.execute(
+            "SELECT p.*, c.case_no, a.animal_code, u.full_name vet_name FROM prescriptions p "
+            "JOIN cases c ON c.id=p.case_id JOIN animals a ON a.id=p.animal_id LEFT JOIN users u ON u.id=p.vet_id "
+            "WHERE c.owner_id=? ORDER BY p.id DESC", (g.user["uid"],)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT p.*, c.case_no, a.animal_code, u.full_name vet_name FROM prescriptions p "
+            "JOIN cases c ON c.id=p.case_id JOIN animals a ON a.id=p.animal_id LEFT JOIN users u ON u.id=p.vet_id "
+            "ORDER BY p.id DESC"
+        ).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+# ----------------------------------------------- treatment response tracking --
+@app.get("/api/cases/<int:case_id>/treatment-responses")
+@auth_required()
+def get_treatment_responses(case_id):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT t.*, u.full_name vet_name FROM treatment_responses t LEFT JOIN users u ON u.id=t.veterinarian_id "
+        "WHERE case_id=? ORDER BY id DESC", (case_id,)
+    ).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+@app.post("/api/cases/<int:case_id>/treatment-responses")
+@auth_required(roles=["vet"])
+def record_treatment_response(case_id):
+    data = request.get_json(force=True) or {}
+    response = data.get("response", "improved").lower()
+    valid_responses = ["improved", "unchanged", "worsened", "recovered", "adverse_reaction", "treatment_discontinued", "follow_up_required"]
+    if response not in valid_responses:
+        return jsonify({"error": f"Invalid response. Must be one of: {', '.join(valid_responses)}"}), 400
+
+    conn = get_db()
+    case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+    if not case:
+        conn.close()
+        return jsonify({"error": "Case not found"}), 404
+
+    cur = conn.execute(
+        """
+        INSERT INTO treatment_responses
+        (case_id, animal_id, prescription_id, response, response_date,
+         veterinarian_id, veterinarian_name, objective_observations, notes, productivity_notes)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        """,
+        (case_id, case["animal_id"], data.get("prescription_id"), response,
+         data.get("response_date", str(date.today())), g.user["uid"], g.user["name"],
+         data.get("objective_observations"), data.get("notes"),
+         data.get("productivity_notes"))
+    )
+    tr_id = cur.lastrowid
+
+    # If recovered, advance status
+    if response == "recovered":
+        conn.execute("UPDATE cases SET status='RECOVERED', updated_at=datetime('now') WHERE id=?", (case_id,))
+        conn.execute("UPDATE animals SET status='Healthy' WHERE id=?", (case["animal_id"],))
+        conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?, 'RECOVERED', ?, ?)",
+                     (case_id, f"Animal recovered. Observations: {data.get('objective_observations', 'Full recovery')}", g.user["name"]))
+        notify(conn, case["owner_id"], f"Case {case['case_no']} marked as RECOVERED by Dr. {g.user['name']}.", "case")
+    elif response == "adverse_reaction":
+        conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?, ?, ?, ?)",
+                     (case_id, case["status"], f"⚠️ ADVERSE REACTION REPORTED: {data.get('notes', 'Adverse drug reaction')}", g.user["name"]))
+    else:
+        conn.execute("INSERT INTO case_updates (case_id, status, note, updated_by) VALUES (?, ?, ?, ?)",
+                     (case_id, case["status"], f"Treatment follow-up: status is {response}.", g.user["name"]))
+
+    audit_log(conn, "RECORD_TREATMENT_RESPONSE", "treatment_response", tr_id,
+              actor_id=g.user["uid"], actor_name=g.user["name"], actor_role=g.user["role"],
+              details={"response": response, "case_no": case["case_no"]})
+    conn.commit()
+    tr = conn.execute("SELECT * FROM treatment_responses WHERE id=?", (tr_id,)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(tr)), 201
+
+
+# --------------------------------------------------------- vaccinations --
+@app.post("/api/vaccinations")
+@auth_required(roles=["vet"])
+def record_vaccination():
+    data = request.get_json(force=True) or {}
+    conn = get_db()
+    animal = conn.execute(
+        "SELECT * FROM animals WHERE animal_code=?", (data.get("animal_id"),)
+    ).fetchone()
+    if not animal:
+        conn.close()
+        return jsonify({"error": "Animal not found"}), 404
+
+    cur = conn.execute(
+        "INSERT INTO vaccinations (animal_id, vaccine, date_given, next_due_date, vet_id) VALUES (?,?,?,?,?)",
+        (animal["id"], data.get("vaccine"), data.get("date_given"), data.get("next_due_date"), g.user["uid"]),
+    )
+    vax_id = cur.lastrowid
+    audit_log(conn, "RECORD_VACCINATION", "vaccination", vax_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"],
+              details={"animal_code": animal["animal_code"], "vaccine": data.get("vaccine")})
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True}), 201
+
+
+# -------------------------------------------------------- notifications --
+@app.get("/api/notifications")
+@auth_required()
+def list_notifications():
+    conn = get_db()
+    notes = conn.execute(
+        "SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 50", (g.user["uid"],)
+    ).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(n) for n in notes])
+
+
+@app.put("/api/notifications/<int:note_id>/read")
+@auth_required()
+def mark_notification_read(note_id):
+    conn = get_db()
+    conn.execute("UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?", (note_id, g.user["uid"]))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+# ------------------------------------------------------------ summaries --
+@app.get("/api/owner/summary")
+@auth_required(roles=["owner"])
+def owner_summary():
+    conn = get_db()
+    uid = g.user["uid"]
+    animals = conn.execute("SELECT COUNT(*) c FROM animals WHERE owner_id=?", (uid,)).fetchone()["c"]
+    active = conn.execute(
+        "SELECT COUNT(*) c FROM cases WHERE owner_id=? AND status NOT IN ('CLOSED','RECOVERED')", (uid,)
+    ).fetchone()["c"]
+    today = date.today().isoformat()
+    vax_due = conn.execute(
+        "SELECT COUNT(*) c FROM vaccinations v JOIN animals a ON a.id=v.animal_id "
+        "WHERE a.owner_id=? AND v.next_due_date <= date('now','+30 day') AND v.next_due_date >= date('now','-30 day')",
+        (uid,),
+    ).fetchone()["c"]
+    lab_reps = conn.execute(
+        "SELECT COUNT(*) c FROM lab_reports l JOIN animals a ON a.id=l.animal_id WHERE a.owner_id=?", (uid,)
+    ).fetchone()["c"]
+    presc = conn.execute(
+        "SELECT COUNT(*) c FROM prescriptions p JOIN animals a ON a.id=p.animal_id WHERE a.owner_id=?", (uid,)
+    ).fetchone()["c"]
+    conn.close()
+    return jsonify({
+        "animals": animals,
+        "active_cases": active,
+        "vaccinations_due": vax_due,
+        "lab_reports": lab_reps,
+        "prescriptions": presc,
+    })
+
+
+@app.get("/api/vet/summary")
+@auth_required(roles=["vet"])
+def vet_summary():
+    conn = get_db()
+    uid = g.user["uid"]
+    new_cases = conn.execute("SELECT COUNT(*) c FROM cases WHERE status='NEW'").fetchone()["c"]
+    lab_pending = conn.execute("SELECT COUNT(*) c FROM cases WHERE status='LAB PENDING'").fetchone()["c"]
+    user_reports = conn.execute("SELECT COUNT(*) c FROM cases").fetchone()["c"]
+    followups = conn.execute(
+        "SELECT COUNT(*) c FROM cases WHERE status IN ('TREATMENT','FOLLOW-UP') AND (vet_id=? OR vet_id IS NULL)",
+        (uid,),
+    ).fetchone()["c"]
+    vax_due = conn.execute(
+        "SELECT COUNT(*) c FROM vaccinations WHERE next_due_date <= date('now','+30 day') AND next_due_date >= date('now','-30 day')"
+    ).fetchone()["c"]
+    conn.close()
+    return jsonify({
+        "new_cases": new_cases,
+        "vaccinations_due": vax_due,
+        "lab_pending": lab_pending,
+        "user_reports": user_reports,
+        "followups": followups,
+    })
+
+
+# ---------------------------------------------------- govt: analytics ---
+@app.get("/api/govt/analytics")
+@auth_required(roles=["govt", "vet"])
+def govt_analytics():
+    conn = get_db()
+    tot_cases = conn.execute("SELECT COUNT(*) c FROM cases").fetchone()["c"]
+    tot_active = conn.execute("SELECT COUNT(*) c FROM cases WHERE status NOT IN ('CLOSED','RECOVERED')").fetchone()["c"]
+    tot_animals = conn.execute("SELECT COUNT(*) c FROM animals").fetchone()["c"]
+    districts = conn.execute("SELECT COUNT(DISTINCT district) c FROM animals WHERE district IS NOT NULL").fetchone()["c"]
+    # Req 1: Total deaths
+    tot_deaths = conn.execute("SELECT COALESCE(SUM(deaths), 0) c FROM cases").fetchone()["c"]
+    deceased_animals = conn.execute("SELECT COUNT(*) c FROM animals WHERE status='Deceased'").fetchone()["c"]
+
+    cbd = conn.execute(
+        "SELECT COALESCE(NULLIF(TRIM(district),''), 'Unknown') d, COUNT(*) c FROM animals a "
+        "JOIN cases cs ON cs.animal_id=a.id GROUP BY LOWER(d) ORDER BY c DESC"
+    ).fetchall()
+    ds = conn.execute(
+        "SELECT COALESCE(NULLIF(TRIM(disease_suspected),''), NULLIF(TRIM(diagnosis),''), 'Unspecified') d, COUNT(*) c "
+        "FROM cases GROUP BY LOWER(d) ORDER BY c DESC LIMIT 6"
+    ).fetchall()
+
+    # Req 10: Block-level data
+    cbb = conn.execute(
+        """SELECT COALESCE(NULLIF(TRIM(a.block),''), 'Unknown') AS block,
+                  COALESCE(NULLIF(TRIM(a.district),''), 'Unknown') AS district,
+                  COUNT(c.id) AS cases,
+                  SUM(CASE WHEN c.status NOT IN ('CLOSED','RECOVERED') THEN 1 ELSE 0 END) AS active
+           FROM animals a JOIN cases c ON c.animal_id=a.id
+           GROUP BY LOWER(district), LOWER(block) ORDER BY cases DESC"""
+    ).fetchall()
+
+    # Req 1: Deaths by district
+    deaths_by_dist = conn.execute(
+        """SELECT COALESCE(NULLIF(TRIM(a.district),''), 'Unknown') AS district,
+                  COALESCE(SUM(c.deaths), 0) AS deaths,
+                  COUNT(CASE WHEN a.status='Deceased' THEN 1 END) AS deceased_animals
+           FROM animals a JOIN cases c ON c.animal_id=a.id
+           GROUP BY LOWER(district) ORDER BY deaths DESC"""
+    ).fetchall()
+
+    # Req 2: Average recovery time and productivity metrics
+    recovery_stats = conn.execute(
+        """SELECT AVG(julianday(tr.response_date) - julianday(c.created_at)) AS avg_recovery_days,
+                  COUNT(*) AS total_responses
+           FROM treatment_responses tr JOIN cases c ON c.id=tr.case_id
+           WHERE tr.response IN ('recovered', 'improved')"""
+    ).fetchone()
+    productivity_notes = conn.execute(
+        """SELECT productivity_notes FROM treatment_responses
+           WHERE productivity_notes IS NOT NULL AND productivity_notes != '' ORDER BY id DESC LIMIT 10"""
+    ).fetchall()
+
+    stock_rows = conn.execute("SELECT district, vaccine, doses_available FROM vaccine_stock ORDER BY district, vaccine").fetchall()
+    stock_by_dist = {}
+    for r in stock_rows:
+        stock_by_dist.setdefault(r["district"], []).append({"vaccine": r["vaccine"], "doses": r["doses_available"]})
+
+    helpline = helpline_analytics(conn)
+    conn.close()
+    return jsonify({
+        "totals": {"cases": tot_cases, "active": tot_active, "animals": tot_animals, "districts": districts,
+                   "deaths": tot_deaths, "deceased_animals": deceased_animals},
+        "cases_by_district": [{"label": r["d"], "value": r["c"]} for r in cbd],
+        "disease_spread": [{"label": r["d"], "value": r["c"]} for r in ds],
+        "cases_by_block": [{"block": r["block"], "district": r["district"], "cases": r["cases"], "active": r["active"]} for r in cbb],
+        "deaths_by_district": [{"district": r["district"], "deaths": r["deaths"], "deceased_animals": r["deceased_animals"]} for r in deaths_by_dist],
+        "recovery_metrics": {
+            "avg_recovery_days": round(float(recovery_stats["avg_recovery_days"] or 0), 1) if recovery_stats else 0,
+            "total_responses": recovery_stats["total_responses"] if recovery_stats else 0,
+        },
+        "productivity_notes": [r["productivity_notes"] for r in productivity_notes],
+        "vaccine_stock": stock_by_dist,
+        "helpline": helpline,
+    })
+
+
+@app.put("/api/govt/stock")
+@auth_required(roles=["govt"])
+def update_stock():
+    data = request.get_json(force=True) or {}
+    district = (data.get("district") or "").strip()
+    vaccine = (data.get("vaccine") or "").strip()
+    try:
+        doses = int(data.get("doses", 0))
+    except (ValueError, TypeError):
+        return jsonify({"error": "doses must be an integer"}), 400
+    if not district or not vaccine:
+        return jsonify({"error": "district and vaccine are required"}), 400
+
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO vaccine_stock (district, vaccine, doses_available, updated_at) "
+        "VALUES (?,?,?,datetime('now')) "
+        "ON CONFLICT(district, vaccine) DO UPDATE SET doses_available=?, updated_at=datetime('now')",
+        (district, vaccine, doses, doses),
+    )
+    audit_log(conn, "UPDATE_VACCINE_STOCK", "vaccine_stock", f"{district}:{vaccine}",
+              actor_id=g.user["uid"], actor_name=g.user["name"], actor_role=g.user["role"],
+              details={"district": district, "vaccine": vaccine, "doses": doses})
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "district": district, "vaccine": vaccine, "doses_available": doses})
+
+
+# --------------------------------------------- vaccination campaigns ---
+@app.get("/api/campaigns")
+@auth_required()
+def list_campaigns():
+    district = (request.args.get("district") or "").strip()
+    status = (request.args.get("status") or "").strip().upper()
+    conn = get_db()
+    query = "SELECT c.*, u.full_name created_by_name FROM vaccination_campaigns c LEFT JOIN users u ON u.id=c.created_by WHERE 1=1"
+    params = []
+    if district:
+        query += " AND LOWER(c.district) = LOWER(?)"
+        params.append(district)
+    if status:
+        query += " AND c.status = ?"
+        params.append(status)
+    query += " ORDER BY c.id DESC"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+@app.post("/api/campaigns")
+@auth_required(roles=["govt"])
+def create_campaign():
+    data = request.get_json(force=True) or {}
+    required = ["name", "district", "vaccine", "target_animals", "start_date", "end_date"]
+    missing = [f for f in required if not data.get(f)]
+    if missing:
+        return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+
+    conn = get_db()
+    dist_prefix = (data["district"][:3] or "PUN").upper()
+    code = next_code(conn, "CAMP", "vaccination_campaigns", "campaign_code", pad=4, district=dist_prefix)
+    cur = conn.execute(
+        "INSERT INTO vaccination_campaigns (campaign_code, name, district, vaccine, target_animals, doses_administered, start_date, end_date, status, notes, created_by) "
+        "VALUES (?,?,?,?,?,0,?,?,?, ?,?)",
+        (code, data["name"].strip(), data["district"].strip(), data["vaccine"].strip(),
+         int(data["target_animals"]), data["start_date"], data["end_date"],
+         data.get("status", "PLANNED").upper(), data.get("notes"), g.user["uid"]),
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM vaccination_campaigns WHERE id=?", (cur.lastrowid,)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(row)), 201
+
+
+@app.put("/api/campaigns/<int:campaign_id>")
+@auth_required(roles=["govt", "vet"])
+def update_campaign(campaign_id):
+    data = request.get_json(force=True) or {}
+    conn = get_db()
+    camp = conn.execute("SELECT * FROM vaccination_campaigns WHERE id=?", (campaign_id,)).fetchone()
+    if not camp:
+        conn.close()
+        return jsonify({"error": "Campaign not found"}), 404
+
+    doses = data.get("doses_administered")
+    new_doses = int(doses) if doses is not None else camp["doses_administered"]
+    status = data.get("status", camp["status"]).upper()
+    notes = data.get("notes", camp["notes"])
+
+    conn.execute(
+        "UPDATE vaccination_campaigns SET doses_administered=?, status=?, notes=?, updated_at=datetime('now') WHERE id=?",
+        (new_doses, status, notes, campaign_id),
+    )
+    conn.commit()
+    updated = conn.execute("SELECT * FROM vaccination_campaigns WHERE id=?", (campaign_id,)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(updated))
+
+
+@app.delete("/api/campaigns/<int:campaign_id>")
+@auth_required(roles=["govt"])
+def delete_campaign(campaign_id):
+    conn = get_db()
+    camp = conn.execute("SELECT * FROM vaccination_campaigns WHERE id=?", (campaign_id,)).fetchone()
+    if not camp:
+        conn.close()
+        return jsonify({"error": "Campaign not found"}), 404
+    conn.execute("DELETE FROM vaccination_campaigns WHERE id=?", (campaign_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "deleted": camp["campaign_code"]})
+
+
+# --------------------------------------------------- govt: GIS / geo data --
+@app.get("/api/govt/geo")
+@auth_required(roles=["govt", "vet"])
+def govt_geo():
+    conn = get_db()
+    rows = conn.execute(
+        """
+        SELECT COALESCE(NULLIF(TRIM(a.district),''), 'Unknown') AS district,
+               COUNT(c.id) AS cases,
+               SUM(CASE WHEN c.status NOT IN ('CLOSED','RECOVERED') THEN 1 ELSE 0 END) AS active,
+               SUM(CASE WHEN LOWER(COALESCE(c.severity,'')) IN ('high','critical') THEN 1 ELSE 0 END) AS high_severity,
+               SUM(CASE WHEN c.reported_through IN ('HELPLINE','IVR') THEN 1 ELSE 0 END) AS helpline_cases,
+               COUNT(DISTINCT c.animal_id) AS affected_animals
+        FROM animals a LEFT JOIN cases c ON c.animal_id = a.id
+        GROUP BY LOWER(district)
+        ORDER BY cases DESC
+        """
+    ).fetchall()
+    animals_by_district = conn.execute(
+        "SELECT COALESCE(NULLIF(TRIM(district),''), 'Unknown') d, COUNT(*) c FROM animals GROUP BY LOWER(d)"
+    ).fetchall()
+    pop = {r["d"].title(): r["c"] for r in animals_by_district}
+    diseases_by_district = conn.execute(
+        """
+        SELECT COALESCE(NULLIF(TRIM(a.district),''), 'Unknown') district,
+               COALESCE(NULLIF(TRIM(c.disease_suspected),''), NULLIF(TRIM(c.diagnosis),''), 'Unspecified') disease,
+               COUNT(*) value
+        FROM cases c JOIN animals a ON a.id=c.animal_id
+        GROUP BY LOWER(district), LOWER(disease)
+        """
+    ).fetchall()
+    conn.close()
+    dmap = {}
+    for r in diseases_by_district:
+        dmap.setdefault(r["district"].title(), []).append({"label": r["disease"], "value": r["value"]})
+    out = []
+    for r in rows:
+        name = r["district"].title()
+        cases = r["cases"] or 0
+        high = r["high_severity"] or 0
+        affected = r["affected_animals"] or 0
+        if high > 0 or affected >= 10:
+            risk = "High Risk"
+        elif affected >= 5 or cases >= 3:
+            risk = "Moderate Risk"
+        else:
+            risk = "Low Risk"
+        out.append({
+            "district": name,
+            "cases": cases,
+            "active": r["active"] or 0,
+            "high_severity": high,
+            "helpline_cases": r["helpline_cases"] or 0,
+            "affected_animals": affected,
+            "animal_population": pop.get(name, 0),
+            "risk_level": risk,
+            "diseases": dmap.get(name, []),
+        })
+    return jsonify(out)
+
+
+# --------------------------------- real spatiotemporal clustering endpoint --
+@app.get("/api/govt/clusters")
+@auth_required(roles=["govt", "vet"])
+def govt_clusters():
+    """Real spatiotemporal disease clustering via DBSCAN on actual cases in DB."""
+    conn = get_db()
+    cases = conn.execute(
+        """
+        SELECT c.id, c.case_no, c.severity, c.disease_suspected, c.diagnosis, c.created_at,
+               a.district, s.collection_lat, s.collection_lng,
+               v.to_lat, v.to_lng
+        FROM cases c
+        JOIN animals a ON a.id=c.animal_id
+        LEFT JOIN samples s ON s.case_id=c.id
+        LEFT JOIN case_visits v ON v.case_id=c.id
+        WHERE c.status NOT IN ('CLOSED', 'RECOVERED')
+        ORDER BY c.id DESC
+        """
+    ).fetchall()
+    conn.close()
+
+    case_items = []
+    for c in cases:
+        dist = c["district"] or "Pune"
+        c_lat = c["to_lat"] or c["collection_lat"]
+        c_lng = c["to_lng"] or c["collection_lng"]
+        if not c_lat or not c_lng:
+            coords = weather.get_coords_for_district(dist)
+            c_lat, c_lng = coords if coords else (18.5204, 73.8567)
+
+        case_items.append({
+            "case_no": c["case_no"],
+            "lat": float(c_lat),
+            "lng": float(c_lng),
+            "district": dist.title(),
+            "disease": c["disease_suspected"] or c["diagnosis"] or "HS",
+            "severity": c["severity"] or "Medium",
+            "created_at": c["created_at"]
+        })
+
+    # Forward to ML backend cluster endpoint
+    res, status = _ml_post("/api/cluster", {"cases": case_items, "eps_km": 45.0, "min_samples": 2})
+    if status == 200:
+        return jsonify(res)
+
+    # In-process DBSCAN fallback if ML backend is offline
+    if len(case_items) >= 2:
+        points = [[c["lat"], c["lng"]] for c in case_items]
+        coords_rad = np.radians(points)
+        db = DBSCAN(eps=45.0 / 6371.0, min_samples=2, metric="haversine").fit(coords_rad)
+        clusters = []
+        for lab in set(db.labels_):
+            if lab == -1:
+                continue
+            c_cases = [case_items[i] for i, l in enumerate(db.labels_) if l == lab]
+            clusters.append({
+                "cluster_id": f"CLUST-GEO-{lab+101}",
+                "district": c_cases[0]["district"],
+                "lat": round(float(np.mean([c["lat"] for c in c_cases])), 4),
+                "lng": round(float(np.mean([c["lng"] for c in c_cases])), 4),
+                "cases": len(c_cases),
+                "diseases": list(set([c["disease"] for c in c_cases])),
+                "risk_level": "High Risk" if len(c_cases) >= 3 else "Moderate Risk",
+                "latest_case": max([c["created_at"] for c in c_cases])[:10],
+                "method": "In-process DBSCAN"
+            })
+        return jsonify({"clusters": clusters, "algorithm": "DBSCAN", "eps_km": 45.0})
+
+    return jsonify({"clusters": [], "algorithm": "DBSCAN", "eps_km": 45.0})
+
+
+# ------------------------------------------------------ disease library --
+DISEASES_PATH = os.path.join(os.path.dirname(__file__), "diseases.json")
+
+
+@app.get("/api/diseases")
+@auth_required()
+def list_diseases():
+    try:
+        with open(DISEASES_PATH, encoding="utf-8") as f:
+            diseases = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return jsonify({"error": "Disease library unavailable"}), 500
+    q = (request.args.get("q") or "").strip().lower()
+    if q:
+        diseases = [
+            d for d in diseases
+            if q in d["name_en"].lower() or q in d["name_mr"]
+            or any(q in a.lower() for a in d.get("aliases", []))
+        ]
+    return jsonify(diseases)
+
+
+# ------------------------------------------------- AI early warning (govt) --
+def resolve_ml_backend():
+    production = (
+        os.environ.get("FLASK_ENV", "").lower() == "production"
+        or os.environ.get("RENDER", "").lower() == "true"
+    )
+    url = (os.environ.get("SIH_ML_BACKEND") or "").strip().rstrip("/")
+    if not url:
+        if not production:
+            return "http://127.0.0.1:8000"  # Local development only.
+        app.logger.error("SIH_ML_BACKEND is required in production; ML requests will return 503.")
+        return None
+    try:
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme not in ("http", "https") or not parsed.hostname
+            or parsed.path or parsed.query or parsed.fragment
+            or parsed.username or parsed.password
+        ):
+            raise ValueError("Use an HTTP(S) base URL without /api, query parameters, or credentials")
+        # Accessing port also validates malformed explicit port values.
+        parsed.port
+        hostname = parsed.hostname.lower()
+        local_address = hostname == "localhost" or hostname.endswith(".localhost")
+        try:
+            address = ip_address(hostname)
+            local_address = local_address or address.is_loopback or address.is_unspecified
+        except ValueError:
+            pass  # DNS hostname, not an IP address.
+        if production and local_address:
+            raise ValueError("Production ML service must not use a localhost/loopback URL")
+    except ValueError as exc:
+        app.logger.error("Invalid SIH_ML_BACKEND: %s; ML requests will return 503.", exc)
+        return None
+    return url
+
+
+ML_BACKEND = resolve_ml_backend()
+
+
+def _ml_post(path, payload):
+    if not ML_BACKEND:
+        return {"error": "AI service is not configured. Set SIH_ML_BACKEND to the deployed ML service base URL."}, 503
+    try:
+        resp = requests.post(ML_BACKEND + path, json=payload, timeout=15)
+    except requests.RequestException as exc:
+        app.logger.warning("ML service request failed for %s: %s", path, exc)
+        return {"error": "AI service is unavailable. Check SIH_ML_BACKEND and the ML service logs."}, 503
+    try:
+        result = resp.json()
+        if not isinstance(result, dict):
+            raise ValueError("Expected a JSON object")
+    except ValueError as exc:
+        app.logger.warning("Invalid ML service response for %s: %s", path, exc)
+        return {"error": "AI service returned an invalid JSON response."}, 502
+    return result, resp.status_code
+
+
+def district_ai_features(conn, district):
+    """Build AI prediction features from REAL database rows for one district,
+    incorporating real weather observations from Open-Meteo API."""
+    animal_population = conn.execute(
+        "SELECT COUNT(*) c FROM animals WHERE LOWER(COALESCE(NULLIF(TRIM(district),''),'unknown'))=LOWER(?)",
+        (district,)).fetchone()["c"]
+    affected_animals = conn.execute(
+        "SELECT COUNT(DISTINCT c.animal_id) c FROM cases c JOIN animals a ON a.id=c.animal_id "
+        "WHERE LOWER(COALESCE(NULLIF(TRIM(a.district),''),'unknown'))=LOWER(?)",
+        (district,)).fetchone()["c"]
+    new_cases = conn.execute(
+        "SELECT COUNT(*) c FROM cases c JOIN animals a ON a.id=c.animal_id "
+        "WHERE LOWER(COALESCE(NULLIF(TRIM(a.district),''),'unknown'))=LOWER(?) "
+        "AND c.created_at >= datetime('now','-30 day')",
+        (district,)).fetchone()["c"]
+    previous_cases = conn.execute(
+        "SELECT COUNT(*) c FROM cases c JOIN animals a ON a.id=c.animal_id "
+        "WHERE LOWER(COALESCE(NULLIF(TRIM(a.district),''),'unknown'))=LOWER(?) "
+        "AND c.created_at < datetime('now','-30 day')",
+        (district,)).fetchone()["c"]
+    vaccinated = conn.execute(
+        "SELECT COUNT(DISTINCT v.animal_id) c FROM vaccinations v JOIN animals a ON a.id=v.animal_id "
+        "WHERE LOWER(COALESCE(NULLIF(TRIM(a.district),''),'unknown'))=LOWER(?)",
+        (district,)).fetchone()["c"]
+    vaccination_coverage = round(vaccinated / animal_population, 3) if animal_population else 0.0
+    growth_rate = round((new_cases - previous_cases) / max(previous_cases, 1), 3)
+
+    # FEATURE GROUP 18: Real weather data integration
+    w_info = weather.fetch_district_weather(conn, district)
+
+    return {
+        "animal_population": float(animal_population),
+        "affected_animals": float(affected_animals),
+        "new_cases": float(new_cases),
+        "deaths": 0.0,
+        "vaccination_coverage": vaccination_coverage,
+        "animal_density": float(animal_population),
+        "previous_cases": float(previous_cases),
+        "cases_growth_rate": growth_rate,
+        "temperature": float(w_info["temperature"]),
+        "rainfall": float(w_info["rainfall"]),
+        "humidity": float(w_info["humidity"]),
+        "weather_source": w_info["source"],
+        "weather_status": w_info["status"],
+        # Req 15: weather reliability flag
+        "weather_reliability": "low" if w_info.get("is_stale") else "high",
+    }
+
+
+@app.get("/api/weather/<district>")
+@auth_required()
+def get_weather(district):
+    conn = get_db()
+    w_info = weather.fetch_district_weather(conn, district)
+    conn.close()
+    return jsonify(w_info)
+
+
+@app.get("/api/govt/ai/districts")
+@auth_required(roles=["govt"])
+def ai_districts():
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT DISTINCT LOWER(COALESCE(NULLIF(TRIM(district),''),'unknown')) d FROM animals").fetchall()
+    conn.close()
+    return jsonify([r["d"].title() for r in rows if r["d"] != "unknown"])
+
+
+@app.get("/api/govt/ai/predict")
+@auth_required(roles=["govt"])
+def ai_predict():
+    district = (request.args.get("district") or "").strip()
+    disease = (request.args.get("disease") or "").strip()
+    if not district or not disease:
+        return jsonify({"error": "district and disease are required"}), 400
+    conn = get_db()
+    try:
+        features = district_ai_features(conn, district)
+    finally:
+        conn.close()
+    payload = {
+        "disease": disease,
+        "district": district,
+        "time_range": "14",
+        "animal_population": features["animal_population"],
+        "affected_animals": features["affected_animals"],
+        "new_cases": features["new_cases"],
+        "deaths": features["deaths"],
+        "vaccination_coverage": features["vaccination_coverage"],
+        "temperature": features["temperature"],
+        "rainfall": features["rainfall"],
+        "humidity": features["humidity"],
+        "animal_density": features["animal_density"],
+        "previous_cases": features["previous_cases"],
+        "cases_growth_rate": features["cases_growth_rate"],
+    }
+    result, status = _ml_post("/api/predict", payload)
+    if status == 200:
+        result["features_used"] = features
+        # Req 15: Pass weather reliability flag to frontend
+        result["weather_reliability"] = features.get("weather_reliability", "high")
+        _last_successful_prediction["timestamp"] = datetime.utcnow().isoformat()
+    return jsonify(result), status
+
+
+@app.get("/api/govt/ai/outbreak")
+@auth_required(roles=["govt"])
+def ai_outbreak():
+    district = (request.args.get("district") or "").strip()
+    if not district:
+        return jsonify({"error": "district is required"}), 400
+    conn = get_db()
+    try:
+        features = district_ai_features(conn, district)
+    finally:
+        conn.close()
+    payload = {
+        "new_cases": features["new_cases"],
+        "cases_growth_rate": features["cases_growth_rate"],
+        "deaths": features["deaths"],
+        "district": district,
+    }
+    result, status = _ml_post("/api/outbreak-detection", payload)
+    return jsonify(result), status
+
+
+@app.get("/api/govt/ai/status")
+@auth_required(roles=["govt"])
+def ai_status():
+    if not ML_BACKEND:
+        return jsonify({"online": False})
+    try:
+        readiness = requests.get(ML_BACKEND + "/api/health", timeout=5)
+        readiness.raise_for_status()
+        health_status = readiness.json()
+        if not isinstance(health_status, dict) or not health_status.get("models_ready"):
+            raise ValueError("Trained ML artifacts are not ready")
+        resp = requests.get(ML_BACKEND + "/api/model-performance", timeout=5)
+        resp.raise_for_status()
+        metrics = resp.json()
+        if not isinstance(metrics, dict) or "accuracy" not in metrics:
+            raise ValueError("Model metrics response is invalid")
+        return jsonify({
+            "online": True,
+            **metrics,
+            "last_successful_prediction": _last_successful_prediction.get("timestamp"),
+        })
+    except (requests.RequestException, ValueError) as exc:
+        app.logger.warning("ML model status check failed: %s", exc)
+        return jsonify({
+            "online": False,
+            "last_successful_prediction": _last_successful_prediction.get("timestamp"),
+        })
+
+
+# ---------------------------- animal-level AI decision support endpoint -----
+@app.get("/api/animals/<int:animal_id>/ai-assessment")
+@auth_required(roles=["vet", "govt", "owner"])
+def get_animal_ai_assessment(animal_id):
+    """Run individual animal clinical decision support engine."""
+    conn = get_db()
+    animal = conn.execute("SELECT * FROM animals WHERE id=?", (animal_id,)).fetchone()
+    if not animal:
+        conn.close()
+        return jsonify({"error": "Animal not found"}), 404
+
+    cases = conn.execute("SELECT * FROM cases WHERE animal_id=? ORDER BY id DESC", (animal_id,)).fetchall()
+    vaccinations = conn.execute("SELECT * FROM vaccinations WHERE animal_id=? ORDER BY date_given DESC", (animal_id,)).fetchall()
+    lab_reports = conn.execute("SELECT * FROM lab_reports WHERE animal_id=? ORDER BY id DESC", (animal_id,)).fetchall()
+    reproductive_records = conn.execute("SELECT * FROM animal_reproductive_records WHERE animal_id=? ORDER BY id DESC", (animal_id,)).fetchall()
+    allergies = conn.execute("SELECT * FROM animal_allergies WHERE animal_id=? ORDER BY id DESC", (animal_id,)).fetchall()
+    medications = conn.execute("SELECT * FROM animal_medications WHERE animal_id=? ORDER BY id DESC", (animal_id,)).fetchall()
+
+    assessment = animal_ai.evaluate_animal_cds(
+        dict(animal), [dict(c) for c in cases], [dict(v) for v in vaccinations],
+        [dict(l) for l in lab_reports], [dict(r) for r in reproductive_records],
+        [dict(al) for al in allergies], [dict(m) for m in medications]
+    )
+
+    # Persist assessment record
+    cur = conn.execute(
+        """
+        INSERT INTO ai_animal_assessments
+        (animal_id, model_version, risk_score, risk_level, abnormal_findings,
+         concern_categories, suggested_next_steps, follow_up_recommendations,
+         explanation_factors, input_summary, confidence)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (animal_id, assessment["model_version"], assessment["risk_score"], assessment["risk_level"],
+         json.dumps(assessment["abnormal_findings"]), json.dumps(assessment["concern_categories"]),
+         json.dumps(assessment["suggested_next_steps"]), json.dumps(assessment["follow_up_recommendations"]),
+         json.dumps(assessment["explanation_factors"]), json.dumps(assessment["input_summary"]),
+         assessment["confidence"])
+    )
+    audit_log(conn, "RUN_ANIMAL_AI_ASSESSMENT", "animal", animal_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"],
+              details={"risk_score": assessment["risk_score"], "risk_level": assessment["risk_level"]})
+    conn.commit()
+    conn.close()
+    return jsonify(assessment)
+
+
+# ----------------------------- farm-level disease intelligence & alerts -----
+@app.get("/api/herds/<int:herd_id>/intelligence")
+@auth_required()
+def herd_intelligence(herd_id):
+    conn = get_db()
+    herd = conn.execute("SELECT * FROM herds WHERE id=?", (herd_id,)).fetchone()
+    if not herd:
+        conn.close()
+        return jsonify({"error": "Herd not found"}), 404
+
+    animals_count = conn.execute("SELECT COUNT(*) c FROM animals WHERE herd_id=?", (herd_id,)).fetchone()["c"]
+    active_cases = conn.execute(
+        "SELECT COUNT(*) c FROM cases WHERE herd_id=? AND status NOT IN ('CLOSED','RECOVERED')", (herd_id,)
+    ).fetchone()["c"]
+    new_cases = conn.execute(
+        "SELECT COUNT(*) c FROM cases WHERE herd_id=? AND created_at >= datetime('now','-30 day')", (herd_id,)
+    ).fetchone()["c"]
+    recovered = conn.execute(
+        "SELECT COUNT(*) c FROM cases WHERE herd_id=? AND status='RECOVERED'", (herd_id,)
+    ).fetchone()["c"]
+
+    diseases = conn.execute(
+        """
+        SELECT COALESCE(disease_suspected, diagnosis, 'Unspecified') disease, COUNT(*) c
+        FROM cases WHERE herd_id=? GROUP BY LOWER(disease)
+        """, (herd_id,)
+    ).fetchall()
+
+    vax_count = conn.execute(
+        """
+        SELECT COUNT(DISTINCT animal_id) c FROM vaccinations
+        WHERE animal_id IN (SELECT id FROM animals WHERE herd_id=?)
+        """, (herd_id,)
+    ).fetchone()["c"]
+
+    vax_cov = round(vax_count / animals_count, 2) if animals_count > 0 else 0.0
+
+    # Risk calculation
+    if active_cases >= 2 or (active_cases >= 1 and vax_cov < 0.5):
+        risk = "High Risk"
+    elif active_cases >= 1 or new_cases >= 1:
+        risk = "Moderate Risk"
+    else:
+        risk = "Low Risk"
+
+    alerts = conn.execute("SELECT * FROM farm_alerts WHERE herd_id=? ORDER BY id DESC", (herd_id,)).fetchall()
+    conn.close()
+
+    return jsonify({
+        "herd_id": herd_id,
+        "herd_code": herd["herd_code"],
+        "village": herd["village"],
+        "district": herd["district"],
+        "total_animals": animals_count,
+        "active_cases": active_cases,
+        "new_cases_30d": new_cases,
+        "recovered_cases": recovered,
+        "vaccination_coverage": vax_cov,
+        "diseases": [dict(d) for d in diseases],
+        "risk_level": risk,
+        "alerts": [row_to_dict(a) for a in alerts]
+    })
+
+
+@app.get("/api/farm-alerts")
+@auth_required(roles=["vet", "govt", "owner"])
+def list_farm_alerts():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM farm_alerts ORDER BY id DESC").fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+@app.post("/api/farm-alerts/<int:alert_id>/acknowledge")
+@auth_required(roles=["vet", "govt"])
+def acknowledge_farm_alert(alert_id):
+    conn = get_db()
+    conn.execute(
+        "UPDATE farm_alerts SET status='ACKNOWLEDGED', acknowledged_by=?, acknowledged_at=datetime('now') WHERE id=?",
+        (g.user["uid"], alert_id)
+    )
+    audit_log(conn, "ACKNOWLEDGE_FARM_ALERT", "farm_alert", alert_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"])
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "status": "ACKNOWLEDGED"})
+
+
+@app.post("/api/farm-alerts/<int:alert_id>/resolve")
+@auth_required(roles=["vet", "govt"])
+def resolve_farm_alert(alert_id):
+    conn = get_db()
+    conn.execute(
+        "UPDATE farm_alerts SET status='RESOLVED', resolved_by=?, resolved_at=datetime('now') WHERE id=?",
+        (g.user["uid"], alert_id)
+    )
+    audit_log(conn, "RESOLVE_FARM_ALERT", "farm_alert", alert_id, actor_id=g.user["uid"],
+              actor_name=g.user["name"], actor_role=g.user["role"])
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "status": "RESOLVED"})
+
+
+# ----------------------------- national surveillance & national alerts ------
+@app.get("/api/national/surveillance")
+@auth_required(roles=["govt", "vet"])
+def national_surveillance():
+    """Hierarchical national livestock surveillance aggregation:
+    Country (India) -> States -> Districts -> Herds -> Animals."""
+    conn = get_db()
+
+    # Real data from Maharashtra in DB
+    mh_animals = conn.execute("SELECT COUNT(*) c FROM animals WHERE COALESCE(state,'Maharashtra')='Maharashtra'").fetchone()["c"]
+    mh_cases = conn.execute(
+        "SELECT COUNT(*) c FROM cases cs JOIN animals a ON a.id=cs.animal_id WHERE COALESCE(a.state,'Maharashtra')='Maharashtra'"
+    ).fetchone()["c"]
+    mh_active = conn.execute(
+        "SELECT COUNT(*) c FROM cases cs JOIN animals a ON a.id=cs.animal_id WHERE COALESCE(a.state,'Maharashtra')='Maharashtra' AND cs.status NOT IN ('CLOSED','RECOVERED')"
+    ).fetchone()["c"]
+    mh_districts = conn.execute("SELECT COUNT(DISTINCT district) c FROM animals WHERE COALESCE(state,'Maharashtra')='Maharashtra'").fetchone()["c"]
+
+    # National state breakdown (Maharashtra active; other Indian states marked clearly as no reporting or pilot)
+    states_data = [
+        {
+            "state": "Maharashtra",
+            "reporting_status": "Active Surveillance Node",
+            "animals_registered": mh_animals,
+            "total_cases": mh_cases,
+            "active_cases": mh_active,
+            "districts_reporting": mh_districts,
+            "risk_index": "Elevated (Monsoon Risk)" if mh_active >= 2 else "Normal"
+        },
+        {
+            "state": "Gujarat",
+            "reporting_status": "No active field node data",
+            "animals_registered": 0,
+            "total_cases": 0,
+            "active_cases": 0,
+            "districts_reporting": 0,
+            "risk_index": "No data available"
+        },
+        {
+            "state": "Karnataka",
+            "reporting_status": "No active field node data",
+            "animals_registered": 0,
+            "total_cases": 0,
+            "active_cases": 0,
+            "districts_reporting": 0,
+            "risk_index": "No data available"
+        },
+        {
+            "state": "Madhya Pradesh",
+            "reporting_status": "No active field node data",
+            "animals_registered": 0,
+            "total_cases": 0,
+            "active_cases": 0,
+            "districts_reporting": 0,
+            "risk_index": "No data available"
+        }
+    ]
+
+    national_alerts = conn.execute("SELECT * FROM national_alerts ORDER BY id DESC").fetchall()
+
+    # Req 20: Zoonotic risk count
+    dk = DiseaseKnowledge.load()
+    zoonotic_diseases = dk.zoonotic_diseases()
+    zoonotic_names = set()
+    for d in zoonotic_diseases:
+        zoonotic_names.add(d.name_en.lower())
+        for a in d.aliases:
+            zoonotic_names.add(a.lower())
+
+    active_cases_all = conn.execute(
+        "SELECT disease_suspected, diagnosis FROM cases WHERE status NOT IN ('CLOSED','RECOVERED')"
+    ).fetchall()
+    zoonotic_count = 0
+    for c in active_cases_all:
+        combined = f"{c['disease_suspected'] or ''} {c['diagnosis'] or ''}".lower()
+        for name in zoonotic_names:
+            if name in combined:
+                zoonotic_count += 1
+                break
+
+    conn.close()
+
+    return jsonify({
+        "country": "India",
+        "hierarchy": "Country -> State -> District -> Block -> Herd -> Animal",
+        "active_states_count": 1,
+        "total_national_animals": mh_animals,
+        "total_national_cases": mh_cases,
+        "total_national_active": mh_active,
+        "zoonotic_risk_count": zoonotic_count,
+        "reporting_scope_note": "Maharashtra currently contains the only active field data. Other states are shown as placeholders.",
+        "states": states_data,
+        "national_alerts": [row_to_dict(a) for a in national_alerts],
+    })
+
+
+@app.get("/api/national/alerts")
+@auth_required(roles=["govt", "vet"])
+def list_national_alerts():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM national_alerts ORDER BY id DESC").fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+@app.post("/api/national/alerts")
+@auth_required(roles=["govt"])
+def create_national_alert():
+    data = request.get_json(force=True) or {}
+    title = (data.get("title") or "").strip()
+    disease = (data.get("disease") or "").strip()
+    state_name = (data.get("state") or "Maharashtra").strip()
+    if not title or not disease:
+        return jsonify({"error": "Title and disease are required"}), 400
+
+    conn = get_db()
+    cur = conn.execute(
+        """
+        INSERT INTO national_alerts
+        (title, state, district, disease, alert_type, severity, affected_count, description, recommended_measures, status)
+        VALUES (?,?,?,?,?,?,?,?,?,'ACTIVE')
+        """,
+        (title, state_name, data.get("district"), disease,
+         data.get("alert_type", "OUTBREAK"), data.get("severity", "HIGH"),
+         int(data.get("affected_count", 1)), data.get("description", ""),
+         data.get("recommended_measures", "Enhanced ring surveillance and movement control"))
+    )
+    alert_id = cur.lastrowid
+    audit_log(conn, "CREATE_NATIONAL_ALERT", "national_alert", alert_id,
+              actor_id=g.user["uid"], actor_name=g.user["name"], actor_role=g.user["role"],
+              details={"title": title, "state": state_name, "disease": disease})
+    conn.commit()
+    row = conn.execute("SELECT * FROM national_alerts WHERE id=?", (alert_id,)).fetchone()
+    conn.close()
+    return jsonify(row_to_dict(row)), 201
+
+
+# ------------------------------------------------ complete audit logs -------
+@app.get("/api/audit-logs")
+@auth_required(roles=["govt", "vet", "lab"])
+def list_audit_logs():
+    conn = get_db()
+    entity_type = request.args.get("entity_type")
+    entity_id = request.args.get("entity_id")
+    limit = min(int(request.args.get("limit", 50)), 200)
+
+    query = "SELECT * FROM audit_events WHERE 1=1"
+    params = []
+    if entity_type:
+        query += " AND entity_type=?"
+        params.append(entity_type)
+    if entity_id:
+        query += " AND entity_id=?"
+        params.append(str(entity_id))
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return jsonify([row_to_dict(r) for r in rows])
+
+
+# -------------------------------------- offline field synchronization -------
+@app.post("/api/sync/queue")
+@auth_required()
+def sync_queue():
+    """Batch synchronize field actions recorded during poor/offline connectivity with client_txn_id deduplication."""
+    data = request.get_json(force=True) or {}
+    items = data.get("items", [])
+    if not isinstance(items, list):
+        return jsonify({"error": "items must be a list of queued operations"}), 400
+
+    conn = get_db()
+    results = []
+    for item in items:
+        txn_id = item.get("client_txn_id")
+        action = item.get("action")
+        payload = item.get("payload", {})
+
+        if not txn_id or not action:
+            continue
+
+        # Check deduplication
+        existing = conn.execute("SELECT id, synced_at FROM offline_sync_log WHERE client_txn_id=?", (txn_id,)).fetchone()
+        if existing:
+            results.append({"client_txn_id": txn_id, "status": "already_synced", "synced_at": existing["synced_at"]})
+            continue
+
+        try:
+            if action == "RECORD_TREATMENT":
+                case_id = payload.get("case_id")
+                response = payload.get("response", "improved")
+                conn.execute(
+                    "INSERT INTO treatment_responses (case_id, animal_id, response, response_date, veterinarian_id, veterinarian_name, notes) "
+                    "VALUES (?, ?, ?, date('now'), ?, ?, ?)",
+                    (case_id, payload.get("animal_id"), response, g.user["uid"], g.user["name"], payload.get("notes"))
+                )
+            elif action == "COLLECT_SAMPLE":
+                case_id = payload.get("case_id")
+                case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+                if case:
+                    code = next_code(conn, "SMP", "samples", "sample_code")
+                    token = f"sqr_{uuid.uuid4().hex}"
+                    conn.execute(
+                        "INSERT INTO samples (sample_code, qr_token, qr_payload, animal_id, case_id, sample_type, status, collector_id, collection_lat, collection_lng, is_manual_location, collection_notes) "
+                        "VALUES (?,?,?,?,?,?,'COLLECTED',?,?,?,?,'Offline synced')",
+                        (code, token, f"PASHU:SAMPLE:{token}", case["animal_id"], case_id,
+                         payload.get("sample_type", "Blood Sample"), g.user["uid"],
+                         payload.get("lat"), payload.get("lng"), int(payload.get("is_manual", 0)))
+                    )
+
+            conn.execute(
+                "INSERT INTO offline_sync_log (client_txn_id, user_id, action, payload) VALUES (?,?,?,?)",
+                (txn_id, g.user["uid"], action, json.dumps(payload))
+            )
+            results.append({"client_txn_id": txn_id, "status": "success"})
+        except Exception as err:
+            results.append({"client_txn_id": txn_id, "status": "error", "error": str(err)})
+
+    conn.commit()
+    conn.close()
+    return jsonify({"synced_count": len([r for r in results if r["status"] == "success"]), "results": results})
+
+
+# ================================================================
+# REQ 1: MORTALITY TRACKING
+# ================================================================
+@app.post("/api/animals/<int:animal_id>/deceased")
+@auth_required(roles=["owner", "vet"])
+def mark_animal_deceased(animal_id):
+    """Mark an animal as deceased with cause of death."""
+    data = request.get_json(force=True) or {}
+    cause = (data.get("cause_of_death") or "").strip()
+    if not cause:
+        return jsonify({"error": "cause_of_death is required"}), 400
+    conn = get_db()
+    try:
+        animal = conn.execute("SELECT * FROM animals WHERE id=?", (animal_id,)).fetchone()
+        if not animal:
+            return jsonify({"error": "Animal not found"}), 404
+        if g.user["role"] == "owner" and animal["owner_id"] != g.user["uid"]:
+            return jsonify({"error": "Not authorized"}), 403
+        conn.execute(
+            "UPDATE animals SET status='Deceased', deceased_at=datetime('now'), cause_of_death=? WHERE id=?",
+            (cause, animal_id),
+        )
+        # Increment deaths count on any active case for this animal
+        conn.execute(
+            "UPDATE cases SET deaths = COALESCE(deaths, 0) + 1 WHERE animal_id=? AND status NOT IN ('CLOSED','RECOVERED')",
+            (animal_id,),
+        )
+        audit_log(conn, "MARK_DECEASED", "animal", animal_id, actor_id=g.user["uid"],
+                  actor_name=g.user["name"], actor_role=g.user["role"],
+                  details={"cause_of_death": cause})
+        conn.commit()
+        return jsonify({"ok": True, "status": "Deceased", "cause_of_death": cause})
+    finally:
+        conn.close()
+
+
+# ================================================================
+# REQ 5: HISTORICAL TRENDS
+# ================================================================
+@app.get("/api/govt/trends")
+@auth_required(roles=["govt", "vet"])
+def govt_trends():
+    """Return case trends grouped by week or month for the last 6 months."""
+    period = (request.args.get("period") or "monthly").strip().lower()
+    conn = get_db()
+    try:
+        if period == "weekly":
+            # SQLite week grouping using date functions
+            rows = conn.execute(
+                """
+                SELECT strftime('%Y-W%W', c.created_at) AS period_label,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN c.status NOT IN ('CLOSED','RECOVERED') THEN 1 ELSE 0 END) AS active,
+                       COALESCE(SUM(c.deaths), 0) AS deaths
+                FROM cases c
+                WHERE c.created_at >= datetime('now', '-6 months')
+                GROUP BY period_label
+                ORDER BY period_label
+                """
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT strftime('%Y-%m', c.created_at) AS period_label,
+                       COUNT(*) AS total,
+                       SUM(CASE WHEN c.status NOT IN ('CLOSED','RECOVERED') THEN 1 ELSE 0 END) AS active,
+                       COALESCE(SUM(c.deaths), 0) AS deaths
+                FROM cases c
+                WHERE c.created_at >= datetime('now', '-6 months')
+                GROUP BY period_label
+                ORDER BY period_label
+                """
+            ).fetchall()
+
+        # Disease-wise trends (top 3)
+        disease_rows = conn.execute(
+            """
+            SELECT strftime('%Y-%m', c.created_at) AS period_label,
+                   COALESCE(NULLIF(TRIM(c.disease_suspected),''), 'Unspecified') AS disease,
+                   COUNT(*) AS total
+            FROM cases c
+            WHERE c.created_at >= datetime('now', '-6 months')
+            GROUP BY period_label, LOWER(disease)
+            ORDER BY period_label, total DESC
+            """
+        ).fetchall()
+        conn.close()
+
+        # Build disease trends by period
+        disease_by_period = {}
+        for r in disease_rows:
+            p = r["period_label"]
+            disease_by_period.setdefault(p, []).append({"disease": r["disease"], "count": r["total"]})
+
+        return jsonify({
+            "period": period,
+            "trends": [dict(r) for r in rows],
+            "disease_trends": disease_by_period,
+        })
+    finally:
+        conn.close()
+
+
+# ================================================================
+# REQ 6: IVR STATUS ENDPOINT
+# ================================================================
+@app.get("/api/ivr/status")
+@auth_required()
+def ivr_status():
+    """Return IVR/PSTN connection status and setup guidance."""
+    settings = get_ivr_settings()
+    return jsonify({
+        "pstn_connected": settings.pstn_connected,
+        "provider_mode": settings.provider_mode,
+        "phone_number": settings.phone_number,
+        "helpline_e164": settings.helpline_e164,
+        "setup_instructions": (
+            "To connect real PSTN, configure IVR_PROVIDER_MODE=SIP_PBX and "
+            "set up a SIP trunk to reach the webhook endpoints "
+            "POST /api/ivr/calls/inbound, /api/ivr/calls/<id>/input, /api/ivr/calls/<id>/events. "
+            "See voice/asterisk/ for example Asterisk configuration."
+        ) if not settings.pstn_connected else "PSTN is connected and verified.",
+    })
+
+
+# ================================================================
+# REQ 8: SMS ADMIN ENDPOINT (Real-time monitoring)
+# ================================================================
+@app.get("/api/admin/sms-log")
+@auth_required(roles=["govt"])
+def sms_log_endpoint():
+    """Return real-time SMS delivery log, dead letters, and worker stats."""
+    return jsonify({
+        "provider": get_sms_provider_info(),
+        "stats": get_worker_stats(),
+        "recent": get_sent_log()[:50],
+        "dead_letters": get_dead_letters()[:20],
+        # Android SMS Gateway (capcom6) status — never exposes credentials.
+        "otp_gateway": sms_gateway.gateway_public_info(),
+    })
+
+
+@app.post("/api/admin/sms-gateway/test")
+@auth_required(roles=["govt"])
+def sms_gateway_test():
+    """Send one fixed-text test SMS so deployment teams can verify real delivery.
+
+    Government users only. The message body is fixed and contains no OTP, and
+    the response never includes gateway credentials.
+    """
+    from ivr_config import normalize_indian_number
+
+    data = request.get_json(silent=True) or {}
+    mobile = data.get("mobile") or data.get("phone")
+    e164 = normalize_indian_number(mobile)
+    if not e164:
+        return jsonify({"error": "Enter a valid 10-digit Indian mobile number.",
+                        "code": "INVALID_MOBILE"}), 400
+    try:
+        result = sms_gateway.send_text_message(
+            e164, "Pashu-Mitra SMS gateway test message. No action required."
+        )
+    except sms_gateway.SmsGatewayError as exc:
+        return jsonify({
+            "accepted": False,
+            "delivered": False,
+            "code": exc.code,
+            "category": exc.category,
+            "api_status": exc.status,
+            "gateway_http_status": exc.upstream_status,
+            "reason": exc.reason,
+            "error": "The SMS gateway did not accept the test message.",
+        }), (503 if exc.code == "SMS_GATEWAY_NOT_CONFIGURED" else 502)
+
+    body = {
+        "accepted": bool(result.get("accepted")),
+        # A gateway 2xx only queues the message; delivery must be observed via
+        # the message state (Pending → Processed → Sent → Delivered/Failed).
+        "delivered": False,
+        "simulated": bool(result.get("simulated")),
+        "mode": result.get("mode"),
+        "message_id": result.get("message_id"),
+        "state": result.get("state"),
+        "gateway_http_status": result.get("http_status"),
+        "device_pinned": bool(result.get("device_id_configured")),
+        "note": ("accepted=true means the gateway queued the SMS for an Android handset. "
+                 "Delivery is proven only by state=Sent/Delivered below."),
+    }
+    if result.get("message_id"):
+        try:
+            body["status_check"] = sms_gateway.get_message_status(result["message_id"])
+        except sms_gateway.SmsGatewayError as exc:
+            body["status_check"] = {"ok": False, **exc.diagnostics()}
+    return jsonify(body)
+
+
+# --------------------------------------------- OTP delivery diagnostics ----
+def otp_diagnostics_required(fn):
+    """Allow access with a government JWT **or** the OTP_DIAG_TOKEN secret.
+
+    The shared secret is read from the environment (Render → Environment) so no
+    credential is ever committed; ``IVR_WEBHOOK_SECRET`` is accepted as a
+    fallback because it is already provisioned as a Render-generated secret.
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        expected = (os.environ.get("OTP_DIAG_TOKEN")
+                    or os.environ.get("IVR_WEBHOOK_SECRET") or "").strip()
+        provided = (request.headers.get("X-Diag-Token") or "").strip()
+        if expected and provided and hmac.compare_digest(provided, expected):
+            return fn(*args, **kwargs)
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            payload = decode_token(auth.split(" ", 1)[1])
+            if not payload:
+                return jsonify({"error": "Invalid or expired token"}), 401
+            if payload.get("role") != "govt":
+                return jsonify({"error": "Forbidden for this role"}), 403
+            g.user = payload
+            return fn(*args, **kwargs)
+        if not expected:
+            return jsonify({
+                "error": "Diagnostics access is not configured. Set OTP_DIAG_TOKEN in the "
+                         "Render environment (or log in as a government user).",
+                "code": "DIAGNOSTICS_NOT_CONFIGURED",
+            }), 503
+        return jsonify({"error": "Missing or invalid credentials", "code": "UNAUTHORIZED"}), 401
+    return wrapper
+
+
+def _otp_diagnostic_findings(report: dict) -> list[str]:
+    """Plain-language findings derived from a diagnostics report."""
+    findings: list[str] = []
+    database = report.get("database") or {}
+    otp = report.get("otp") or {}
+
+    if not database.get("path_configured"):
+        findings.append(
+            "SIH_DB_PATH is not set: the SQLite file lives inside the container and is "
+            "wiped on every Render deploy/restart, which destroys in-flight OTPs."
+        )
+    elif not database.get("persistent_mount_configured"):
+        findings.append(
+            "SIH_DB_PATH does not point inside the Render disk mount (/var/data): OTP rows "
+            "and farmer data are lost on redeploy."
+        )
+    if not otp.get("pepper_stable"):
+        findings.append(
+            "The OTP pepper is generated per process (OTP_PEPPER/SIH_SECRET_KEY unset): with "
+            "more than one Gunicorn worker, a correct OTP issued by one worker is rejected by "
+            "the other with 401. Set a stable OTP_PEPPER."
+        )
+    gateway = otp.get("gateway") or {}
+    mode = str(gateway.get("mode") or "").upper()
+    if not gateway.get("usable", True):
+        findings.append("The SMS gateway is not usable with the current environment variables.")
+    if mode == "MOCK":
+        findings.append(
+            "SMS_GATEWAY_MODE=MOCK: no SMS leaves the server. The API still accepts the request "
+            "and the UI shows conditional wording, but nothing was dispatched — switch to CLOUD "
+            "with real credentials for production delivery."
+        )
+    if mode == "DISABLED":
+        findings.append("SMS_GATEWAY_MODE=DISABLED: OTP requests are refused with HTTP 503.")
+    if mode == "CLOUD" and gateway.get("usable") and not gateway.get("device_pinned"):
+        findings.append(
+            "SMS_GATEWAY_DEVICE_ID is not set: the cloud server picks a random device of the "
+            "account, so a stale handset can receive the dispatch. Pin the OTP handset using "
+            "GET /3rdparty/v1/devices."
+        )
+
+    if report.get("mobile_masked"):
+        if report.get("owner_registered") is False:
+            findings.append(
+                "No farmer (role=owner) account matches this mobile number in the production "
+                "database: request-otp returns the generic 200 but sends no SMS and stores no "
+                "OTP, so verification always fails with 401 OTP_INVALID (reason=no_otp_row)."
+            )
+        latest = report.get("latest_otp")
+        if not latest:
+            findings.append("No OTP row was ever written for this number.")
+        else:
+            if latest.get("pepper_fingerprint_matches") is False:
+                findings.append(
+                    "The stored pepper fingerprint differs from this process: the OTP was hashed "
+                    "with a different/rotated pepper, so the code cannot verify (reason=pepper_mismatch)."
+                )
+            if latest.get("send_error_code"):
+                findings.append(
+                    f"The SMS gateway rejected the last OTP send ({latest['send_error_code']}, "
+                    f"category={latest.get('send_error_category')}, "
+                    f"http={latest.get('gateway_http_status')}): the row is SEND_FAILED and no code "
+                    "was delivered."
+                )
+            if latest.get("status") == "ACTIVE" and not latest.get("gateway_state"):
+                findings.append(
+                    "The ACTIVE OTP row has no gateway state recorded (issued before gateway "
+                    "diagnostics existed, or the send did not reach the gateway)."
+                )
+            if latest.get("expired"):
+                findings.append("The latest OTP has expired (5-minute TTL).")
+
+    devices = ((report.get("live_checks") or {}).get("devices") or {})
+    if devices.get("ok") and devices.get("count") == 0:
+        findings.append(
+            "The gateway account lists no devices: the SMS stays Pending on the cloud "
+            "server and is never handed to a handset."
+        )
+    status = ((report.get("live_checks") or {}).get("message_status") or {})
+    if status.get("ok"):
+        state = str(status.get("state") or "")
+        if state.lower() == "pending":
+            findings.append(
+                "The last message is still Pending at the gateway: it was queued but no handset "
+                "has sent it (device offline, wrong device, or device-side queue/rate limits)."
+            )
+        elif state.lower() == "failed":
+            findings.append(f"The gateway reports the last message as Failed ({status.get('reason')}).")
+        elif state.lower() in ("sent", "delivered", "processed"):
+            findings.append(
+                f"The gateway reports the last message as {state}: the handset handed the SMS to "
+                "the carrier. If it never arrived, check the handset/SIM/number (DND, wrong number)."
+            )
+    return findings
+
+
+@app.get("/api/admin/otp-diagnostics")
+@otp_diagnostics_required
+def otp_diagnostics_endpoint():
+    """Trace a farmer OTP request/verification failure to its exact cause.
+
+    Read-only and secret-free: states, counts, masked recipients and gateway
+    status codes only — never an OTP, hash, credential or full phone number.
+    ``?live=1`` additionally queries the gateway (device list + message state),
+    which is the only way to obtain delivery evidence.
+    """
+    mobile = request.args.get("mobile") or request.args.get("phone")
+    try:
+        events = int(request.args.get("events") or 5)
+    except (TypeError, ValueError):
+        events = 5
+    live = str(request.args.get("live") or "").strip().lower() in ("1", "true", "yes", "on")
+
+    report = otp_diagnostics(mobile, recent_limit=max(1, min(20, events)))
+    if live:
+        live_report: dict = {"requested": True}
+        # Live checks are bounded: they call the gateway synchronously, so a
+        # leaked token must not become a request amplifier (60/min per IP).
+        if not shared_rate_limit_ok(f"otp-diag-live:{request.remote_addr or 'unknown'}"):
+            live_report = {"ok": False, "code": "RATE_LIMITED",
+                           "reason": "too many live gateway checks; retry in a minute"}
+        else:
+            try:
+                live_report["devices"] = sms_gateway.list_devices(timeout=10)
+            except sms_gateway.SmsGatewayError as exc:
+                live_report["devices"] = {"ok": False, **exc.diagnostics()}
+            message_id = (request.args.get("message_id")
+                          or (report.get("latest_otp") or {}).get("gateway_message_id"))
+            if message_id:
+                try:
+                    live_report["message_status"] = sms_gateway.get_message_status(
+                        message_id, timeout=10)
+                except sms_gateway.SmsGatewayError as exc:
+                    live_report["message_status"] = {"ok": False, **exc.diagnostics()}
+            else:
+                live_report["message_status"] = {
+                    "ok": False, "code": "NO_MESSAGE_ID",
+                    "reason": "no gateway message id recorded for this number",
+                }
+        report["live_checks"] = live_report
+    report["findings"] = _otp_diagnostic_findings(report)
+    return jsonify(report)
+
+
+# ================================================================
+# REQ 9: AI AUTO-ESCALATION (integrated into case creation)
+# ================================================================
+def _auto_escalate_case(conn, case_row):
+    """Run CDS on the case's animal and auto-escalate if high risk."""
+    from database import audit_log as _audit_log
+    animal = conn.execute("SELECT * FROM animals WHERE id=?", (case_row["animal_id"],)).fetchone()
+    if not animal:
+        return
+    cases = conn.execute("SELECT * FROM cases WHERE animal_id=? ORDER BY id DESC", (animal["id"],)).fetchall()
+    vaccinations = conn.execute("SELECT * FROM vaccinations WHERE animal_id=? ORDER BY date_given DESC", (animal["id"],)).fetchall()
+    lab_reports = conn.execute("SELECT * FROM lab_reports WHERE animal_id=? ORDER BY id DESC", (animal["id"],)).fetchall()
+    repro = conn.execute("SELECT * FROM animal_reproductive_records WHERE animal_id=? ORDER BY id DESC", (animal["id"],)).fetchall()
+    allergies = conn.execute("SELECT * FROM animal_allergies WHERE animal_id=? ORDER BY id DESC", (animal["id"],)).fetchall()
+    meds = conn.execute("SELECT * FROM animal_medications WHERE animal_id=? ORDER BY id DESC", (animal["id"],)).fetchall()
+
+    try:
+        assessment = animal_ai.evaluate_animal_cds(
+            dict(animal), [dict(c) for c in cases], [dict(v) for v in vaccinations],
+            [dict(l) for l in lab_reports], [dict(r) for r in repro],
+            [dict(al) for al in allergies], [dict(m) for m in meds]
+        )
+    except Exception:
+        return
+
+    risk_level = assessment.get("risk_level", "")
+    matched_diseases = [f.get("factor", "") for f in assessment.get("explanation_factors", []) if "FMD" in f.get("factor", "") or "BQ" in f.get("factor", "")]
+
+    if risk_level == "High Risk" or matched_diseases:
+        # Escalate
+        conn.execute("UPDATE cases SET severity='Critical', ai_auto_escalated=1 WHERE id=?", (case_row["id"],))
+        district = animal["district"] or "Unknown"
+        disease_text = matched_diseases[0] if matched_diseases else risk_level
+
+        # Notify all vets in district
+        regional_vets = conn.execute("SELECT id FROM users WHERE role='vet' AND LOWER(COALESCE(district,''))=LOWER(?)", (district,)).fetchall()
+        for v in regional_vets:
+            notify(conn, v["id"], f"URGENT: Case {case_row['case_no']} auto-escalated to Critical. Risk: {disease_text}.",
+                   "case", template_key="auto_escalation", case_no=case_row["case_no"], disease=disease_text)
+
+        # Create farm alert if not exists
+        existing_alert = conn.execute("SELECT id FROM farm_alerts WHERE herd_id=? AND status='ACTIVE' AND disease LIKE ?",
+                                      (case_row["herd_id"] or 0, f"%{disease_text[:10]}%")).fetchone()
+        if not existing_alert and case_row["herd_id"]:
+            herd = conn.execute("SELECT * FROM herds WHERE id=?", (case_row["herd_id"],)).fetchone()
+            if herd:
+                conn.execute(
+                    """INSERT INTO farm_alerts (herd_id, herd_code, district, disease, affected_animals_count,
+                       risk_level, trigger_reason, recommended_action, status) VALUES (?,?,?,?,?,'High',?,?, 'ACTIVE')""",
+                    (herd["id"], herd["herd_code"], district, disease_text, 1,
+                     f"AI auto-escalation: {risk_level}", "Immediate veterinary inspection recommended")
+                )
+        _audit_log(conn, "AI_AUTO_ESCALATE", "case", case_row["id"],
+                   actor_name="AI Triage System", actor_role="system",
+                   details={"risk_level": risk_level, "disease": disease_text})
+
+
+# ================================================================
+# REQ 10: BLOCK-LEVEL ANALYTICS
+# ================================================================
+# (Extend govt_analytics — will be added as a new section)
+
+
+# ================================================================
+# REQ 11: LOCAL DISEASE ADVISORIES
+# ================================================================
+@app.get("/api/advisories")
+@auth_required(roles=["owner", "vet"])
+def get_advisories():
+    """Return localized disease advisories for the signed-in user's district."""
+    district = (request.args.get("district") or "").strip()
+    conn = get_db()
+    try:
+        if not district:
+            user = conn.execute("SELECT district FROM users WHERE id=?", (g.user["uid"],)).fetchone()
+            district = user["district"] if user else "Unknown"
+
+        # 1. Disease risk level
+        risk_data = conn.execute(
+            """SELECT COUNT(*) AS total,
+               SUM(CASE WHEN c.status NOT IN ('CLOSED','RECOVERED') THEN 1 ELSE 0 END) AS active,
+               SUM(CASE WHEN LOWER(COALESCE(c.severity,'')) IN ('high','critical') THEN 1 ELSE 0 END) AS high_sev
+            FROM cases c JOIN animals a ON a.id=c.animal_id
+            WHERE LOWER(COALESCE(a.district,''))=LOWER(?)""",
+            (district,)
+        ).fetchone()
+        total = risk_data["total"] or 0
+        active = risk_data["active"] or 0
+        high_sev = risk_data["high_sev"] or 0
+
+        if high_sev > 0:
+            risk_level = "High Risk"
+        elif active >= 3:
+            risk_level = "Moderate Risk"
+        else:
+            risk_level = "Low Risk"
+
+        # 2. Active outbreaks / farm alerts
+        alerts = conn.execute(
+            "SELECT * FROM farm_alerts WHERE LOWER(district)=LOWER(?) AND status='ACTIVE' ORDER BY id DESC LIMIT 5",
+            (district,)
+        ).fetchall()
+
+        # 3. Weather-based advisories
+        w = weather.fetch_district_weather(conn, district)
+        weather_advisories = []
+        temp = w.get("temperature", 28)
+        humidity = w.get("humidity", 60)
+        rainfall = w.get("rainfall", 0)
+        if humidity > 80:
+            weather_advisories.append("High humidity — watch for mastitis and fungal infections.")
+        if temp > 38:
+            weather_advisories.append("Extreme heat — ensure shade and water for livestock.")
+        if rainfall > 20:
+            weather_advisories.append("Heavy rainfall — watch for foot rot and vector-borne diseases.")
+        if humidity > 70 and temp > 30:
+            weather_advisories.append("Warm and humid — increased risk of Haemorrhagic Septicaemia.")
+
+        # 4. Vaccination campaign reminders
+        campaigns = conn.execute(
+            "SELECT * FROM vaccination_campaigns WHERE LOWER(district)=LOWER(?) AND status='ACTIVE' ORDER BY id DESC LIMIT 3",
+            (district,)
+        ).fetchall()
+
+        # Preferred language for advisory translation
+        lang = g.user.get("preferred_language") or "en"
+        user_row = conn.execute("SELECT preferred_language FROM users WHERE id=?", (g.user["uid"],)).fetchone()
+        if user_row and user_row["preferred_language"]:
+            lang = user_row["preferred_language"]
+
+        conn.close()
+
+        return jsonify({
+            "district": district,
+            "risk_level": risk_level,
+            "active_cases": active,
+            "weather_advisories": weather_advisories,
+            "weather": {"temperature": temp, "humidity": humidity, "rainfall": rainfall, "source": w.get("source", "")},
+            "alerts": [row_to_dict(a) for a in alerts],
+            "campaigns": [row_to_dict(c) for c in campaigns],
+            "language": lang,
+        })
+    finally:
+        conn.close()
+
+
+# ================================================================
+# REQ 12: DATA EXPORT
+# ================================================================
+@app.get("/api/govt/export")
+@auth_required(roles=["govt"])
+def govt_export():
+    """Export cases, animals, or campaigns as CSV, JSON, Excel, or PDF. GA-37/38."""
+    import csv
+    import io
+
+    export_type = (request.args.get("type") or "cases").strip().lower()
+    fmt = (request.args.get("format") or "json").strip().lower()
+    date_from = (request.args.get("from") or "").strip()
+    date_to = (request.args.get("to") or "").strip()
+    page = int(request.args.get("page") or 1)
+    page_size = min(int(request.args.get("page_size") or 50), 500)
+
+    if export_type not in ("cases", "animals", "campaigns"):
+        return jsonify({"error": "type must be cases, animals, or campaigns"}), 400
+
+    conn = get_db()
+    try:
+        if export_type == "cases":
+            base_query = "SELECT c.*, a.animal_code, a.species, a.district AS animal_district FROM cases c JOIN animals a ON a.id=c.animal_id WHERE 1=1"
+            count_query = "SELECT COUNT(*) FROM cases c JOIN animals a ON a.id=c.animal_id WHERE 1=1"
+            params = []
+            if date_from:
+                base_query += " AND c.created_at >= ?"
+                count_query += " AND c.created_at >= ?"
+                params.append(date_from)
+            if date_to:
+                base_query += " AND c.created_at <= ?"
+                count_query += " AND c.created_at <= ?"
+                params.append(date_to + " 23:59:59")
+            total = conn.execute(count_query, params).fetchone()[0]
+            if fmt in ("json", "csv", "xlsx", "excel", "pdf"):
+                # For export, ignore pagination unless explicit paginated flag
+                if request.args.get("paginated") == "1":
+                    base_query += " ORDER BY c.id DESC LIMIT ? OFFSET ?"
+                    params_p = params + [page_size, (page-1)*page_size]
+                    rows = conn.execute(base_query, params_p).fetchall()
+                else:
+                    base_query += " ORDER BY c.id DESC"
+                    rows = conn.execute(base_query, params).fetchall()
+            else:
+                base_query += " ORDER BY c.id DESC LIMIT ? OFFSET ?"
+                rows = conn.execute(base_query, params + [page_size, (page-1)*page_size]).fetchall()
+            data = [dict(r) for r in rows]
+        elif export_type == "animals":
+            base_query = "SELECT * FROM animals WHERE 1=1"
+            count_query = "SELECT COUNT(*) FROM animals WHERE 1=1"
+            params = []
+            if date_from:
+                base_query += " AND created_at >= ?"
+                count_query += " AND created_at >= ?"
+                params.append(date_from)
+            if date_to:
+                base_query += " AND created_at <= ?"
+                count_query += " AND created_at <= ?"
+                params.append(date_to + " 23:59:59")
+            total = conn.execute(count_query, params).fetchone()[0]
+            if request.args.get("paginated") == "1":
+                base_query += " ORDER BY id DESC LIMIT ? OFFSET ?"
+                rows = conn.execute(base_query, params + [page_size, (page-1)*page_size]).fetchall()
+            else:
+                base_query += " ORDER BY id DESC"
+                rows = conn.execute(base_query, params).fetchall()
+            data = [dict(r) for r in rows]
+        else:
+            total = conn.execute("SELECT COUNT(*) FROM vaccination_campaigns").fetchone()[0]
+            if request.args.get("paginated") == "1":
+                rows = conn.execute("SELECT * FROM vaccination_campaigns ORDER BY id DESC LIMIT ? OFFSET ?", (page_size, (page-1)*page_size)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM vaccination_campaigns ORDER BY id DESC").fetchall()
+            data = [dict(r) for r in rows]
+        conn.close()
+
+        # Paginated JSON response for reports UI (GA-37)
+        if request.args.get("paginated") == "1" and fmt == "json":
+            return jsonify({"items": data, "total": total, "page": page, "page_size": page_size, "total_pages": (total + page_size -1)//page_size})
+
+        if fmt == "csv":
+            if not data:
+                from flask import Response
+                return Response("No data", mimetype="text/csv", headers={"Content-Disposition": f"attachment;filename={export_type}.csv"})
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=data[0].keys())
+            writer.writeheader()
+            writer.writerows(data)
+            from flask import Response
+            return Response(output.getvalue(), mimetype="text/csv",
+                            headers={"Content-Disposition": f"attachment;filename=pashumitra_{export_type}.csv"})
+        elif fmt in ("xlsx", "excel"):
+            try:
+                import openpyxl
+                wb = openpyxl.Workbook()
+                ws = wb.active
+                ws.title = export_type
+                if data:
+                    ws.append(list(data[0].keys()))
+                    for row in data:
+                        ws.append([row.get(k) for k in data[0].keys()])
+                bio = io.BytesIO()
+                wb.save(bio)
+                bio.seek(0)
+                from flask import Response
+                return Response(bio.getvalue(),
+                                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                headers={"Content-Disposition": f"attachment;filename=pashumitra_{export_type}.xlsx"})
+            except ImportError:
+                # Fallback to CSV if openpyxl not installed
+                output = io.StringIO()
+                if data:
+                    writer = csv.DictWriter(output, fieldnames=data[0].keys())
+                    writer.writeheader()
+                    writer.writerows(data)
+                else:
+                    output.write("No data")
+                from flask import Response
+                return Response(output.getvalue(), mimetype="text/csv",
+                                headers={"Content-Disposition": f"attachment;filename=pashumitra_{export_type}.csv",
+                                         "X-Export-Note": "Excel library not available, CSV fallback"})
+        elif fmt == "pdf":
+            try:
+                from reportlab.lib.pagesizes import A4
+                from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+                from reportlab.lib.styles import getSampleStyleSheet
+                from reportlab.lib import colors
+                bio = io.BytesIO()
+                doc = SimpleDocTemplate(bio, pagesize=A4)
+                styles = getSampleStyleSheet()
+                story = [Paragraph(f"Pashu-Mitra {export_type.title()} Report", styles['Title']), Spacer(1,12),
+                         Paragraph(f"Generated: {__import__('datetime').datetime.utcnow().isoformat()}Z | Total: {len(data)}", styles['Normal']), Spacer(1,12)]
+                if data:
+                    # Limit columns for PDF readability
+                    cols = list(data[0].keys())[:8]
+                    table_data = [cols] + [[str(r.get(c,""))[:40] for c in cols] for r in data[:100]]
+                    t = Table(table_data)
+                    t.setStyle(TableStyle([
+                        ('BACKGROUND', (0,0), (-1,0), colors.grey),
+                        ('TEXTCOLOR', (0,0), (-1,0), colors.whitesmoke),
+                        ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+                        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                        ('FONTSIZE', (0,0), (-1,-1), 7),
+                        ('GRID', (0,0), (-1,-1), 0.5, colors.black),
+                    ]))
+                    story.append(t)
+                    if len(data) > 100:
+                        story.append(Spacer(1,12))
+                        story.append(Paragraph(f"... {len(data)-100} more rows truncated in PDF. Use Excel/CSV for full data.", styles['Italic']))
+                else:
+                    story.append(Paragraph("No data", styles['Normal']))
+                doc.build(story)
+                bio.seek(0)
+                from flask import Response
+                return Response(bio.getvalue(), mimetype="application/pdf",
+                                headers={"Content-Disposition": f"attachment;filename=pashumitra_{export_type}.pdf"})
+            except ImportError:
+                # Fallback to JSON with note
+                return jsonify({"items": data[:100], "total": len(data), "note": "PDF library not available, JSON fallback truncated to 100"}), 200, {"X-Export-Note": "reportlab not available"}
+        else:
+            return jsonify(data)
+    except Exception as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ================================================================
+# REQ 13: MULTI-STATE REPORTING STATUS
+# (Modify national_surveillance — add reporting_status field)
+# ================================================================
+# The existing national_surveillance already uses "Active Surveillance Node" etc.
+# We just need to add a standard reporting_status field.
+
+
+# ================================================================
+# REQ 15: WEATHER RELIABILITY FLAG
+# (Modify district_ai_features to include reliability)
+# ================================================================
+# Will be added by modifying the existing function
+
+
+# ================================================================
+# REQ 16: ML HEALTH LAST SUCCESSFUL PREDICTION
+# ================================================================
+_last_successful_prediction = {"timestamp": None}
+
+
+# ================================================================
+# REQ 17: PUSH NOTIFICATION SUBSCRIPTIONS
+# ================================================================
+@app.post("/api/push/subscribe")
+@auth_required()
+def push_subscribe():
+    """Subscribe to Web Push notifications."""
+    data = request.get_json(force=True) or {}
+    endpoint = data.get("endpoint")
+    keys = data.get("keys", {})
+    p256dh = keys.get("p256dh", "")
+    auth = keys.get("auth", "")
+    if not endpoint or not p256dh or not auth:
+        return jsonify({"error": "endpoint, keys.p256dh and keys.auth are required"}), 400
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, user_agent)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(user_id, endpoint) DO UPDATE SET p256dh=excluded.p256dh, auth=excluded.auth""",
+            (g.user["uid"], endpoint, p256dh, auth, request.headers.get("User-Agent", ""))
+        )
+        conn.commit()
+        return jsonify({"ok": True, "push_configured": is_push_configured()})
+    finally:
+        conn.close()
+
+
+@app.post("/api/push/unsubscribe")
+@auth_required()
+def push_unsubscribe():
+    """Unsubscribe from Web Push notifications."""
+    data = request.get_json(force=True) or {}
+    endpoint = data.get("endpoint", "")
+    conn = get_db()
+    try:
+        conn.execute("DELETE FROM push_subscriptions WHERE user_id=? AND endpoint=?",
+                     (g.user["uid"], endpoint))
+        conn.commit()
+        return jsonify({"ok": True})
+    finally:
+        conn.close()
+
+
+@app.get("/api/push/vapid-key")
+@auth_required()
+def get_vapid_public_key():
+    """Return the VAPID public key for the frontend Push API."""
+    key = get_public_key()
+    return jsonify({"publicKey": key or None, "configured": is_push_configured()})
+
+
+# ================================================================
+# REQ 18: FARMER FEEDBACK
+# ================================================================
+@app.post("/api/cases/<int:case_id>/farmer-feedback")
+@auth_required(roles=["owner"])
+def submit_farmer_feedback(case_id):
+    """Allow animal owners to submit recovery feedback on their own cases."""
+    data = request.get_json(force=True) or {}
+    recovery_status = (data.get("recovery_status") or "").strip().lower()
+    if recovery_status not in ("improving", "same", "worse"):
+        return jsonify({"error": "recovery_status must be improving, same, or worse"}), 400
+    notes = (data.get("notes") or "").strip()
+    photo_url = (data.get("photo_url") or "").strip() or None
+
+    conn = get_db()
+    try:
+        case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+        if not case:
+            return jsonify({"error": "Case not found"}), 404
+        if case["owner_id"] != g.user["uid"]:
+            return jsonify({"error": "Not authorized"}), 403
+
+        cur = conn.execute(
+            """INSERT INTO farmer_feedback (case_id, owner_id, animal_id, recovery_status, notes, photo_url)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (case_id, g.user["uid"], case["animal_id"], recovery_status, notes, photo_url)
+        )
+        feedback_id = cur.lastrowid
+
+        # Notify vet if assigned
+        if case["vet_id"]:
+            msg = f"Farmer feedback on {case['case_no']}: patient is {recovery_status}."
+            if notes:
+                msg += f" Notes: {notes[:100]}"
+            notify(conn, case["vet_id"], msg, "case")
+
+        # If worsening, create urgent notification
+        if recovery_status == "worse":
+            if case["vet_id"]:
+                notify(conn, case["vet_id"], f"⚠️ URGENT: Animal for {case['case_no']} reported WORSENING by farmer.", "case")
+            # Notify govt officers in district
+            animal = conn.execute("SELECT district FROM animals WHERE id=?", (case["animal_id"],)).fetchone()
+            if animal:
+                govt_users = conn.execute("SELECT id FROM users WHERE role='govt' AND LOWER(COALESCE(district,''))=LOWER(?)",
+                                          (animal["district"] or "",)).fetchall()
+                for gu in govt_users:
+                    notify(conn, gu["id"], f"⚠️ Farmer reports worsening for case {case['case_no']} in {animal['district']}.", "case")
+
+        audit_log(conn, "FARMER_FEEDBACK", "case", case_id, actor_id=g.user["uid"],
+                  actor_name=g.user["name"], actor_role="owner",
+                  details={"recovery_status": recovery_status})
+        conn.commit()
+        feedback = conn.execute("SELECT * FROM farmer_feedback WHERE id=?", (feedback_id,)).fetchone()
+        return jsonify(row_to_dict(feedback)), 201
+    finally:
+        conn.close()
+
+
+@app.get("/api/cases/<int:case_id>/farmer-feedback")
+@auth_required()
+def get_farmer_feedback(case_id):
+    """Get farmer feedback for a case."""
+    conn = get_db()
+    try:
+        case = conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone()
+        if not case:
+            return jsonify({"error": "Case not found"}), 404
+        if g.user["role"] == "owner" and case["owner_id"] != g.user["uid"]:
+            return jsonify({"error": "Not authorized"}), 403
+        rows = conn.execute("SELECT * FROM farmer_feedback WHERE case_id=? ORDER BY id DESC", (case_id,)).fetchall()
+        return jsonify([row_to_dict(r) for r in rows])
+    finally:
+        conn.close()
+
+
+# ================================================================
+# REQ 20: ZOONOTIC RISK ENDPOINT
+# ================================================================
+@app.get("/api/govt/zoonotic")
+@auth_required(roles=["govt", "vet"])
+def zoonotic_risk():
+    """Return zoonotic disease risk data from diseases.json + active cases."""
+    conn = get_db()
+    try:
+        dk = DiseaseKnowledge.load()
+        zoonotic = dk.zoonotic_diseases()
+        zoonotic_names = [d.name_en for d in zoonotic]
+        zoonotic_aliases = set()
+        for d in zoonotic:
+            zoonotic_aliases.add(d.name_en.lower())
+            for a in d.aliases:
+                zoonotic_aliases.add(a.lower())
+
+        # Find active cases that match zoonotic diseases
+        all_cases = conn.execute(
+            """SELECT c.*, a.district, a.animal_code FROM cases c
+               JOIN animals a ON a.id=c.animal_id
+               WHERE c.status NOT IN ('CLOSED','RECOVERED')"""
+        ).fetchall()
+
+        zoonotic_cases = []
+        for c in all_cases:
+            suspected = (c["disease_suspected"] or "").lower()
+            diagnosis = (c["diagnosis"] or "").lower()
+            combined = f"{suspected} {diagnosis}"
+            for name in zoonotic_aliases:
+                if name in combined:
+                    zoonotic_cases.append(dict(c))
+                    break
+
+        # District-wise count
+        district_counts = {}
+        for c in zoonotic_cases:
+            d = c.get("district") or "Unknown"
+            district_counts[d] = district_counts.get(d, 0) + 1
+
+        conn.close()
+        return jsonify({
+            "zoonotic_diseases": [{"name": d.name_en, "name_mr": d.name_mr, "category": d.category, "risk_level": d.risk_level} for d in zoonotic],
+            "active_zoonotic_cases": len(zoonotic_cases),
+            "cases_by_district": district_counts,
+            "cases": zoonotic_cases[:20],
+        })
+    finally:
+        conn.close()
+
+
+# ==========================================================================
+# REAL-TIME WEB CALLING (farmer <-> veterinarian browser audio)
+# --------------------------------------------------------------------------
+# Authenticated, server-authorized call lifecycle + signaling endpoints.
+# The media never touches this server: audio flows peer-to-peer over WebRTC.
+# These routes only create/authorize state, route the call to one eligible
+# veterinarian, and record accurate lifecycle timestamps.
+#
+# This is a different channel from the PSTN/IVR helpline above: the helpline
+# (phone number 7382210251) requires a real telephony provider and is not
+# served by these endpoints.
+# ==========================================================================
+def _webcall_error_response(exc):
+    payload = {"error": exc.message, "code": exc.code}
+    if exc.call:
+        payload["call"] = exc.call
+    return jsonify(payload), exc.status_code
+
+
+def _webcall_client(conn, user_id):
+    return conn.execute("SELECT id, full_name, role FROM users WHERE id=?", (user_id,)).fetchone()
+
+
+@app.get("/api/webcall/config")
+@auth_required()
+def webcall_config():
+    """Everything the browser needs before it opens a call.
+
+    Includes per-session ICE servers (STUN + short-lived TURN credentials when
+    configured), the absolute signaling URL for split frontend/backend
+    deployments, and the server-side rules (ring timeout, reasons, languages).
+    """
+    conn = get_db()
+    try:
+        me = conn.execute(
+            "SELECT id, role, full_name, preferred_language, district, block, village FROM users WHERE id=?",
+            (g.user["uid"],),
+        ).fetchone()
+        settings = get_ivr_settings()
+        presence = webcalling.presence_state(conn, g.user["uid"]) if g.user["role"] == "vet" else None
+        active = webcalling.active_call_for(conn, g.user["uid"], g.user["role"])
+        availability = None
+        if g.user["role"] == "vet":
+            row = conn.execute(
+                "SELECT status, supported_languages FROM vet_availability WHERE vet_id=?", (g.user["uid"],)
+            ).fetchone()
+            availability = {
+                "status": row["status"] if row else "OFFLINE",
+                "supported_languages": json.loads(row["supported_languages"]) if row else ["en"],
+            }
+        return jsonify({
+            "channel": "webrtc_web_call",
+            "audio": "peer_to_peer_webrtc",
+            "user": {
+                "id": me["id"], "role": me["role"], "name": me["full_name"],
+                "language": me["preferred_language"] or "en",
+                "district": me["district"], "block": me["block"], "village": me["village"],
+            },
+            "ice_servers": turn_config.ice_servers(g.user["uid"]),
+            "ice": turn_config.describe(),
+            "ice_transport_policy": turn_config.ice_transport_policy(),
+            "signaling": {
+                # Empty means "same origin as this page" (dev / single-service).
+                # In production Vercel + Render split deployments this must be
+                # the absolute Render backend URL so the browser opens WSS
+                # directly to the backend instead of through the Vercel /api rewrite.
+                "url": socket_public_url(),
+                # Which variable supplied the URL (never a secret): makes a
+                # same-origin fallback visible instead of silently failing.
+                "url_source": socket_public_url_source(),
+                # The exact WSS endpoint the browser will open (empty when the
+                # deployment is same-origin).
+                "endpoint": signaling_endpoint(),
+                # Always browser-safe (leading slash): Socket.IO's client appends
+                # this value to the origin, so "socket.io" would become
+                # "https://hostsocket.io/" and never reach the server.
+                "path": socketio_path(),
+                "transports": ["websocket", "polling"],
+                "offline_warning_seconds": 10,
+                # Self-diagnosis for the browser that just asked: if its own
+                # Origin is not in the allow-list the handshake WILL be rejected
+                # (CORS for polling, connect_error for WebSocket). Reporting the
+                # boolean lets the portal say "this deployment's origin is not
+                # permitted" instead of the misleading "signaling offline".
+                # The allow-list itself is already public in /api/health.
+                "client_origin": (request.headers.get("Origin") or ""),
+                "client_origin_allowed": origin_allowed(request.headers.get("Origin")),
+            },
+            "ring_timeout_seconds": webcalling.ring_timeout_seconds(),
+            "supported_languages": [
+                {"code": code, "name": LANGUAGE_NAMES[code]} for code in SUPPORTED_LANGUAGES
+            ],
+            "call_reasons": list(webcalling.CALL_REASONS),
+            "push": {"configured": is_push_configured()},
+            "availability": availability,
+            "presence": presence,
+            "active_call_id": active["call_id"] if active else None,
+            "helpline": {
+                "number": settings.phone_number,
+                "pstn_connected": settings.pstn_connected,
+                "note": (
+                    "The web call uses this browser's microphone and needs no phone network."
+                    if not settings.pstn_connected else
+                    "A PSTN helpline is also configured."
+                ),
+            },
+        })
+    finally:
+        conn.close()
+
+
+@app.post("/api/webcall/calls")
+@auth_required(roles=["owner"])
+def webcall_create_call():
+    """Start a call for the authenticated farmer and route it to one vet.
+
+    The farmer's identity, region and role are read from the database — never
+    from the request body — and the router only selects a veterinarian who is
+    explicitly available, has a live portal session, speaks the requested
+    language and is not already on a call.
+    """
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"error": "Invalid request body"}), 400
+    if not shared_rate_limit_ok(f"webcall:create:{g.user['uid']}"):
+        return jsonify({"error": "Too many call attempts. Please wait a moment.", "code": "rate_limited"}), 429
+
+    conn = get_db()
+    try:
+        try:
+            result = webcalling.create_call(conn, caller=g.user, payload=data)
+        except webcalling.WebCallError as exc:
+            return _webcall_error_response(exc)
+        call = result["call"]
+        row = webcalling._row(conn, call["call_id"])
+        if row["status"] == "ringing" and row["vet_id"]:
+            webcalling.notify_vet_of_call(conn, row)
+            emit_to_user(
+                int(row["vet_id"]), "call:incoming",
+                {"call": webcalling.serialize_call(conn, row, viewer={"uid": row["vet_id"], "role": "vet"})},
+            )
+            emit_call_event(row, "ringing")
+            # The caller is told a ring actually started; there is no "connected"
+            # state until the veterinarian answers and media is established.
+            emit_to_user(int(row["caller_id"]), "call:update", {
+                "call_id": row["call_id"], "status": row["status"], "event": "placed",
+                "vet": call["vet"],
+            })
+        else:
+            emit_to_user(int(row["caller_id"]), "call:update", {
+                "call_id": call["call_id"], "status": call["status"], "event": "unavailable",
+                "message": result.get("message"),
+            })
+        return jsonify(result), 201 if row["status"] == "ringing" else 200
+    finally:
+        conn.close()
+
+
+@app.get("/api/webcall/calls/current")
+@auth_required()
+def webcall_current_call():
+    """Reconciliation endpoint: the caller/vet's live call, if any."""
+    conn = get_db()
+    try:
+        webcalling.expire_stale_calls(conn)
+        row = webcalling.active_call_for(conn, g.user["uid"], g.user["role"])
+        return jsonify({
+            "call": webcalling.serialize_call(conn, row, viewer=g.user) if row else None,
+        })
+    finally:
+        conn.close()
+
+
+@app.get("/api/webcall/calls/history")
+@auth_required()
+def webcall_history():
+    """Authorized call history (own calls; government oversight sees all)."""
+    conn = get_db()
+    try:
+        try:
+            limit = int(request.args.get("limit", 50))
+            offset = int(request.args.get("offset", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "limit/offset must be integers"}), 400
+        try:
+            calls = webcalling.list_history(conn, g.user, limit=limit, offset=offset)
+        except webcalling.WebCallError as exc:
+            return _webcall_error_response(exc)
+        return jsonify({"calls": calls, "count": len(calls)})
+    finally:
+        conn.close()
+
+
+@app.get("/api/webcall/calls/<call_id>")
+@auth_required()
+def webcall_call_detail(call_id):
+    conn = get_db()
+    try:
+        webcalling.expire_stale_calls(conn)
+        try:
+            call = webcalling.get_call(conn, call_id, g.user)
+        except webcalling.WebCallError as exc:
+            return _webcall_error_response(exc)
+        return jsonify({"call": call})
+    finally:
+        conn.close()
+
+
+@app.post("/api/webcall/calls/<call_id>/accept")
+@auth_required(roles=["vet"])
+def webcall_accept(call_id):
+    conn = get_db()
+    try:
+        try:
+            call = webcalling.accept_call(conn, call_id, g.user)
+        except webcalling.WebCallError as exc:
+            return _webcall_error_response(exc)
+        row = webcalling._row(conn, call_id)
+        emit_call_event(row, "accepted")
+        return jsonify({"call": call})
+    finally:
+        conn.close()
+
+
+@app.post("/api/webcall/calls/<call_id>/reject")
+@auth_required(roles=["vet"])
+def webcall_reject(call_id):
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    try:
+        try:
+            call = webcalling.reject_call(conn, call_id, g.user, reason=(data.get("reason") or "").strip() or None)
+        except webcalling.WebCallError as exc:
+            return _webcall_error_response(exc)
+        emit_call_event(webcalling._row(conn, call_id), "rejected", extra={"reason": data.get("reason")})
+        return jsonify({"call": call})
+    finally:
+        conn.close()
+
+
+@app.post("/api/webcall/calls/<call_id>/cancel")
+@auth_required(roles=["owner"])
+def webcall_cancel(call_id):
+    conn = get_db()
+    try:
+        try:
+            call = webcalling.cancel_call(conn, call_id, g.user)
+        except webcalling.WebCallError as exc:
+            return _webcall_error_response(exc)
+        emit_call_event(webcalling._row(conn, call_id), "cancelled")
+        return jsonify({"call": call})
+    finally:
+        conn.close()
+
+
+@app.post("/api/webcall/calls/<call_id>/end")
+@auth_required()
+def webcall_end(call_id):
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    try:
+        try:
+            call = webcalling.end_call(conn, call_id, g.user, reason=(data.get("reason") or "").strip() or None)
+        except webcalling.WebCallError as exc:
+            return _webcall_error_response(exc)
+        emit_call_event(webcalling._row(conn, call_id), "ended")
+        return jsonify({"call": call})
+    finally:
+        conn.close()
+
+
+@app.post("/api/webcall/calls/<call_id>/connecting")
+@auth_required()
+def webcall_connecting(call_id):
+    conn = get_db()
+    try:
+        try:
+            call = webcalling.mark_connecting(conn, call_id, g.user)
+        except webcalling.WebCallError as exc:
+            return _webcall_error_response(exc)
+        emit_call_event(webcalling._row(conn, call_id), "connecting")
+        return jsonify({"call": call})
+    finally:
+        conn.close()
+
+
+@app.post("/api/webcall/calls/<call_id>/connected")
+@auth_required()
+def webcall_connected(call_id):
+    """Report a genuinely established RTCPeerConnection (client-side event)."""
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    try:
+        try:
+            call = webcalling.mark_connected(conn, call_id, g.user, media_confirmed=bool(data.get("media_confirmed")))
+        except webcalling.WebCallError as exc:
+            return _webcall_error_response(exc)
+        emit_call_event(webcalling._row(conn, call_id), "connected", extra={"media_confirmed": bool(data.get("media_confirmed"))})
+        return jsonify({"call": call})
+    finally:
+        conn.close()
+
+
+@app.post("/api/webcall/calls/<call_id>/failed")
+@auth_required()
+def webcall_failed(call_id):
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    try:
+        try:
+            call = webcalling.mark_failed(conn, call_id, g.user, reason=(data.get("reason") or "").strip() or None)
+        except webcalling.WebCallError as exc:
+            return _webcall_error_response(exc)
+        emit_call_event(webcalling._row(conn, call_id), "failed", extra={"reason": data.get("reason")})
+        return jsonify({"call": call})
+    finally:
+        conn.close()
+
+
+@app.get("/api/webcall/calls/<call_id>/signals")
+@auth_required()
+def webcall_signals(call_id):
+    """Durable signaling backfill (participants only).
+
+    The socket relay delivers signals immediately; this endpoint closes any gap
+    (worker hand-off, tab refresh, reconnect) and is what makes the signaling
+    path worker-independent.
+    """
+    conn = get_db()
+    try:
+        try:
+            after = int(request.args.get("after", 0))
+        except (TypeError, ValueError):
+            after = 0
+        try:
+            signals = webcalling.list_signals(conn, call_id, g.user, after=after)
+        except webcalling.WebCallError as exc:
+            return _webcall_error_response(exc)
+        row = webcalling._row(conn, call_id)
+        first = conn.execute(
+            "SELECT MIN(id) AS first_id FROM web_call_signals WHERE call_id=?", (call_id,)
+        ).fetchone()["first_id"]
+        return jsonify({
+            "signals": signals,
+            "last_signal_id": signals[-1]["id"] if signals else after,
+            # Lets a client that missed (or had pruned) early signals resynchronize
+            # instead of stalling on a gap.
+            "first_signal_id": first,
+            "status": row["status"] if row else None,
+            "call": webcalling.serialize_call(conn, row, viewer=g.user) if row else None,
+        })
+    finally:
+        conn.close()
+
+
+@app.post("/api/webcall/presence")
+@auth_required(roles=["vet"])
+def webcall_presence_heartbeat():
+    """REST fallback for the presence lease (used when sockets are blocked)."""
+    data = request.get_json(silent=True) or {}
+    conn = get_db()
+    try:
+        state = webcalling.heartbeat(conn, g.user["uid"], client=(data.get("client") or "")[:120])
+        active = webcalling.active_call_for(conn, g.user["uid"], "vet")
+        state["active_call"] = {"call_id": active["call_id"], "status": active["status"]} if active else None
+        return jsonify(state)
+    finally:
+        conn.close()
+
+
+@app.delete("/api/webcall/presence")
+@auth_required(roles=["vet"])
+def webcall_presence_offline():
+    conn = get_db()
+    try:
+        webcalling.drop_presence(conn, g.user["uid"])
+        return jsonify(webcalling.presence_state(conn, g.user["uid"]))
+    finally:
+        conn.close()
+
+
+@app.get("/api/webcall/availability")
+@auth_required(roles=["owner", "vet", "govt"])
+def webcall_availability():
+    """Truthful availability/presence snapshot (no phone numbers).
+
+    * Farmer/owner: a pre-call routability check for the selected language,
+      using the authenticated farmer's real profile and (optionally) their
+      selected case/animal context.
+    * Vet/Govt: a fleet snapshot for operational dashboards.
+    """
+    conn = get_db()
+    try:
+        if g.user["role"] == "owner":
+            payload = {
+                "language": request.args.get("language"),
+                "reason": request.args.get("reason") or "animal_sick",
+                "case_id": request.args.get("case_id"),
+                "animal_id": request.args.get("animal_id"),
+            }
+            try:
+                result = webcalling.preflight_farmer_availability(conn, caller=g.user, payload=payload)
+            except webcalling.WebCallError as exc:
+                return _webcall_error_response(exc)
+            result["helpline"] = {
+                "number": get_ivr_settings().phone_number,
+                "pstn_connected": get_ivr_settings().pstn_connected,
+            }
+            return jsonify(result)
+        return jsonify({"veterinarians": webcalling.available_veterinarians(conn)})
+    finally:
+        conn.close()
+
+
+@app.get("/api/webcall/summary")
+@auth_required(roles=["vet"])
+def webcall_summary():
+    conn = get_db()
+    try:
+        return jsonify({
+            "stats": webcalling.stats_for_vet(conn, g.user["uid"]),
+            "presence": webcalling.presence_state(conn, g.user["uid"]),
+        })
+    finally:
+        conn.close()
+
+
+# ==========================================================================
+# COMPLIANCE — application-side security, safe errors, feedback, upload rules
+# --------------------------------------------------------------------------
+# Additive only: this registers response headers, error handlers and two new
+# API routes. It does not modify, rename or remove any existing route,
+# response contract, authentication behaviour or database column.
+#
+#   GIGW 3.0 C1.2c  custom error pages, no source code in errors
+#   GIGW 3.0 C1.2d  hardened HTTP response headers (CSP report-only by default)
+#   GIGW 3.0 C1.2o  server-side input validation
+#   GIGW 3.0 Q11    feedback collected through an online form
+#   GuDApps 4.4     validation (server-side authoritative)
+#   GuDApps 4.5     document upload security
+# ==========================================================================
+import compliance_security  # noqa: E402  (imported here so `app` already exists)
+import captcha_service  # noqa: E402  (CAPTCHA hook GA-21, env-driven, no secrets)
+import validation as validation_service  # noqa: E402  (GA-1-5 systematic validation)
+
+compliance_security.install(app, get_db=get_db)
+captcha_service.install_captcha(app)
+
+# Ensure the additive feedback table exists at startup (idempotent).
+try:
+    _c = get_db()
+    try:
+        compliance_security.ensure_feedback_table(_c)
+    finally:
+        _c.close()
+except Exception:  # pragma: no cover - never block startup on this
+    logging.getLogger(__name__).warning("site_feedback table could not be pre-created")

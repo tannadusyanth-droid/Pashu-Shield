@@ -1,0 +1,233 @@
+services:
+  # Flask API and the existing static frontend. For a split Vercel frontend,
+  # Vercel proxies /api/* to this service.
+  - type: web
+    name: pashu-shield-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    # Web calling runs a long-lived Socket.IO WebSocket inside this service, so
+    # the worker model matters (measured on 2026-10-04 with gunicorn 23):
+    #   * sync worker, 2 workers  -> Engine.IO polling sessions break ("Invalid
+    #     session": each HTTP request may land on a worker that does not hold the
+    #     session) and a REST-triggered `call:incoming` never reaches a socket in
+    #     another process (measured 0/6 delivered).
+    #   * sync worker, 1 worker   -> the socket occupies the only worker; REST
+    #     requests queued for 120 s (health checks would fail).
+    #   * gthread, 1 worker, 100 threads -> 4/4 events delivered in 5-9 ms, REST
+    #     median 3 ms, WebSocket *and* polling transports both work.
+    # One process is required because Socket.IO rooms are per-process; scale out
+    # only together with SIH_REDIS_URL (message queue) or a separate signalling
+    # service. See WEB_CALLING.md.
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --worker-class gthread --workers 1 --threads 100 --timeout 120 --access-logfile - --error-logfile -
+    healthCheckPath: /api/health
+    disk:
+      name: pashu-shield-sqlite
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: SIH_SECRET_KEY
+        generateValue: true
+      - key: IVR_WEBHOOK_SECRET
+        generateValue: true
+      - key: SIH_DB_PATH
+        value: /var/data/animal_health.db
+      - key: SIH_ML_BACKEND
+        sync: false
+      - key: IVR_PHONE_NUMBER
+        value: "7382210251"
+      - key: IVR_PROVIDER_MODE
+        value: MOCK
+      - key: IVR_PSTN_CONNECTED
+        value: "false"
+      - key: FLASK_ENV
+        value: production
+      # ------------------------------------------------ farmer OTP login ---
+      # Android SMS Gateway (capcom6) Cloud Server credentials.
+      # sync: false keeps the values out of Git — set them in the Render
+      # dashboard (or as secret files) before enabling OTP login.
+      - key: SMS_GATEWAY_MODE
+        value: CLOUD
+      - key: SMS_GATEWAY_BASE_URL
+        value: https://api.sms-gate.app/3rdparty/v1
+      - key: SMS_GATEWAY_USERNAME
+        sync: false
+      - key: SMS_GATEWAY_PASSWORD
+        sync: false
+      # Pin the OTP handset. Without it the cloud server picks a device at
+      # random from the account (documented multi-device behaviour).
+      - key: SMS_GATEWAY_DEVICE_ID
+        sync: false
+      - key: SMS_GATEWAY_TIMEOUT
+        value: "15"
+      - key: SMS_GATEWAY_CONNECT_TIMEOUT
+        value: "5"
+      # OTPs must not sit in the device queue for hours; 5 minutes matches the
+      # OTP TTL, and priority 100 bypasses device-side delays/rate limits.
+      - key: SMS_GATEWAY_TTL_SECONDS
+        value: "300"
+      - key: SMS_GATEWAY_PRIORITY
+        value: "100"
+      # Farmer phone OTP via Clerk (see CLERK_PHONE_LOGIN.md). Paste the keys
+      # from dashboard.clerk.com -> Configure -> API keys.
+      - key: CLERK_PUBLISHABLE_KEY
+        sync: false
+      - key: CLERK_SECRET_KEY
+        sync: false
+      # Stable pepper for real Farmer OTP hashing and signup tokens. A per-process
+      # pepper can make a genuine SMS OTP fail across Gunicorn workers.
+      - key: OTP_PEPPER
+        generateValue: true
+      # Secret for GET /api/admin/otp-diagnostics (delivery tracing).
+      - key: OTP_DIAG_TOKEN
+        generateValue: true
+      - key: OTP_TTL_SECONDS
+        value: "300"
+      - key: OTP_MAX_ATTEMPTS
+        value: "5"
+      - key: OTP_RESEND_COOLDOWN_SECONDS
+        value: "60"
+      # Farmer auth is OTP-only (no password fallback); staff keep password login.
+      - key: OTP_REGISTRATION_TOKEN_TTL_SECONDS
+        value: "900"
+      # ---------------------------------------------- prototype demo account
+      # Ships OFF. Set DEMO_MODE=true AND DEMO_MODE_ALLOW_PRODUCTION=true in the
+      # Render dashboard to show the Demo Account box (fixed OTP) on a prototype
+      # deployment; set both back to false before any public production use.
+      # The documented credentials are explicit here as well as in .env.example.
+      # See DEMO_ACCOUNT.md.
+      - key: DEMO_MODE
+        value: "false"
+      - key: DEMO_MODE_ALLOW_PRODUCTION
+        value: "false"
+      - key: DEMO_FARMER_MOBILE
+        value: "8341564042"
+      - key: DEMO_FARMER_OTP
+        value: "123456"
+
+      # ------------------------------------------------ real-time web calling
+      # The signalling socket runs inside this service (Flask-SocketIO) and must
+      # live in the SAME process that emits call events, so the deployment uses
+      # one gthread worker (see startCommand). Set SIH_REDIS_URL to add a message
+      # queue before raising the worker count; SIH_GUNICORN_WORKERS only makes
+      # the code log a warning when cross-worker delivery is not shared.
+      - key: SIH_GUNICORN_WORKERS
+        value: "1"
+      - key: SIH_WEBCALL_RING_TIMEOUT_SECONDS
+        value: "45"
+      - key: SIH_WEBCALL_SWEEPER
+        value: "true"
+      - key: SIH_WEBCALL_PUSH_SYNC
+        value: "1"
+      - key: SIH_STUN_URLS
+        value: stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302
+      # Browser origins allowed to open the signaling socket (the Vercel portal).
+      # EXPLICIT origins only — never "*" and never "https://*.vercel.app".
+      #
+      # IMPORTANT: blueprint (render.yaml) env vars are applied when a service
+      # is CREATED. An existing service keeps its old value until the variable
+      # is edited in the Render dashboard (or the blueprint is synced), so in
+      # practice this variable is a fallback: backend/realtime.py also carries
+      # the same origins as an explicit built-in list so a new Vercel preview
+      # URL cannot silently break web calling. Check the effective list with
+      #   GET /api/health -> web_calling.allowed_origins
+      #                     -> web_calling.allowed_origins_source
+      #
+      # RECOMMENDED: keep ONE stable Vercel production domain and list it here;
+      # add a preview origin temporarily only while testing that preview.
+      - key: SIH_ALLOWED_ORIGINS
+        value: https://pashu-mitra-smoky.vercel.app,https://pashu-mitra-2bu09eba6-pashu-shield.vercel.app,https://pashu-mitra-efyqsdomw-pashu-shield.vercel.app
+      # Socket.IO path. MUST keep the leading slash: the browser client appends
+      # this value to the origin, so "socket.io" produces
+      # "https://hostsocket.io/" (unresolvable) and signaling never connects
+      # (2026-10-05 incident). The backend normalizes the value for the server
+      # and for the browser, and /api/health reports the effective
+      # web_calling.signaling_url + web_calling.socketio_path.
+      - key: SIH_SOCKETIO_PATH
+        value: /socket.io
+      # Secrets: set in the Render dashboard, never in Git.
+      # TURN is required for mobile-carrier/CGNAT peers.
+      #
+      # THIS DEPLOYMENT USES METERED STATIC CREDENTIALS. Paste exactly three
+      # values into the Render dashboard for THIS service, then redeploy:
+      #
+      #   SIH_TURN_URLS        (not a secret — the four Metered endpoints)
+      #     ["turn:global.relay.metered.ca:80",
+      #      "turn:global.relay.metered.ca:80?transport=tcp",
+      #      "turn:global.relay.metered.ca:443",
+      #      "turns:global.relay.metered.ca:443?transport=tcp"]
+      #     (a JSON array, or the same four URLs comma/newline separated)
+      #   SIH_TURN_USERNAME    <your Metered username — SECRET>
+      #   SIH_TURN_CREDENTIAL  <your Metered credential — SECRET>
+      #
+      #   SIH_TURN_SECRET      MUST BE DELETED OR LEFT EMPTY.
+      #     A non-empty secret wins the mode selection and switches the backend
+      #     to coturn ephemeral credentials, which Metered rejects — the call
+      #     then fails even though turn_configured reads true.
+      #
+      # The alternative mode (self-hosted coturn) is SIH_TURN_URLS +
+      # SIH_TURN_SECRET with no username/credential; do not mix the two.
+      # Never place TURN credentials in frontend code or in this file.
+      #
+      # NOTE: `sync: false` means a blueprint deploy creates the key EMPTY.
+      # The value only becomes usable when it is pasted into the Render
+      # dashboard for THIS service (pashu-shield-backend) and the service is
+      # restarted/redeployed. Variables set on the Vercel frontend project or
+      # on pashu-shield-ml are invisible to this API. After a redeploy,
+      # GET /api/health -> web_calling.ice must show turn_configured: true,
+      # turn_mode: "static" and turn_url_count: 4; if it still shows
+      # turn_mode: none, the turn_config_issue / turn_env fields name the
+      # variable that is missing or empty (variable names and states only —
+      # never a value). Verified 2026-10-05: the deployed service reported
+      # SIH_TURN_URLS=missing with USERNAME/CREDENTIAL=set, i.e. only
+      # SIH_TURN_URLS was absent.
+      - key: SIH_TURN_URLS
+        sync: false
+      - key: SIH_TURN_USERNAME
+        sync: false
+      - key: SIH_TURN_CREDENTIAL
+        sync: false
+      # coturn REST mode only — leave unset/empty for the Metered static setup.
+      - key: SIH_TURN_SECRET
+        sync: false
+      # Lifetime of an ephemeral (coturn REST) credential; unused in static
+      # provider mode. Optional — the code default is already 3600 s.
+      - key: SIH_TURN_TTL_SECONDS
+        value: "3600"
+      # Public HTTPS/WSS URL of this service for browser-side signaling.
+      # RECOMMENDED for a split Vercel frontend + Render backend so Socket.IO
+      # opens WSS directly to Render; leave blank only for same-origin/local dev.
+      # When it is blank, backend/realtime.py falls back to Render's own
+      # RENDER_EXTERNAL_URL, so signaling still resolves to this service and
+      # never to the Vercel host (Vercel only proxies /api/*, not /socket.io).
+      # Verify: GET /api/health -> web_calling.signaling_url +
+      #         web_calling.signaling_url_source.
+      - key: SIH_PUBLIC_BACKEND_URL
+        sync: false
+      # Web Push (ringing the vet when the portal tab is in the background).
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_CLAIM_EMAIL
+        sync: false
+      # Optional Redis message queue for Socket.IO fan-out across workers.
+      - key: SIH_REDIS_URL
+        sync: false
+
+  # Existing trained-model API. If this service is already deployed separately,
+  # create only the backend service above and point SIH_ML_BACKEND at its URL.
+  - type: web
+    name: pashu-shield-ml
+    runtime: python
+    rootDir: ml-backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1 --timeout-keep-alive 120
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: APP_BASE_URL
+        sync: false

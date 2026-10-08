@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="robots" content="noindex, nofollow" />
+<title>Brand guidelines — Pashu Mitra</title>
+<link rel="icon" type="image/svg+xml" href="assets/brand/favicon.svg" />
+<link rel="stylesheet" href="dbim-tokens.css" />
+<style>
+  body{margin:0}
+  main{max-width:960px;margin:0 auto;padding:24px 16px 64px}
+  h1{margin:0 0 8px} h2{margin:40px 0 12px;border-bottom:2px solid var(--dbim-key);padding-bottom:6px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}
+  .tile{border:1px solid var(--dbim-grey-3);border-radius:8px;padding:16px;background:var(--dbim-white)}
+  .tile.dark{background:var(--dbim-key);color:var(--dbim-white)}
+  .tile img{display:block;max-width:100%;height:auto}
+  .tile figcaption,.note{font-size:var(--dbim-fs-p2);margin-top:8px}
+  .dark .cap{color:var(--dbim-white)}
+  code{background:var(--dbim-linen);padding:1px 4px;border-radius:4px}
+  .skip{position:absolute;left:-999px} .skip:focus{left:8px;top:8px;background:var(--dbim-white);padding:8px}
+  table{border-collapse:collapse;width:100%} th,td{border:1px solid var(--dbim-grey-3);padding:8px;text-align:left} th{background:var(--dbim-linen)}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to main content</a>
+<main id="main">
+  <h1>Pashu Mitra brand guidelines</h1>
+  <p>Designed to conform to DBIM 3.0 (5.2.4 Lockup 3B, 5.3, 5.5) and GIGW 3.0; CQW/STQC certification pending audit. This is an independent initiative and not an official Government of India website. Logos are original artwork; no State Emblem or government logo is used.</p>
+
+  <h2>Lockups (single colour only)</h2>
+  <div class="grid">
+    <figure class="tile"><img src="assets/brand/pashumitra_standard_eng_black.svg" width="290" height="67" alt="Pashu Mitra horizontal logo, English, black"><figcaption>standard · eng · black (header)</figcaption></figure>
+    <figure class="tile dark"><img src="assets/brand/pashumitra_standard_eng_white.svg" width="290" height="67" alt="Pashu Mitra horizontal logo, English, white"><figcaption>standard · eng · white (footer)</figcaption></figure>
+    <figure class="tile"><img src="assets/brand/pashumitra_standard_hin_black.svg" width="230" height="67" alt="पशु मित्र horizontal logo, Hindi, black"><figcaption>standard · hin · black</figcaption></figure>
+    <figure class="tile dark"><img src="assets/brand/pashumitra_standard_hin_white.svg" width="230" height="67" alt="पशु मित्र horizontal logo, Hindi, white"><figcaption>standard · hin · white</figcaption></figure>
+    <figure class="tile"><img src="assets/brand/pashumitra_alternate_eng_black.svg" width="170" height="130" alt="Pashu Mitra vertical logo, English, black"><figcaption>alternate (vertical) · eng · black</figcaption></figure>
+    <figure class="tile"><img src="assets/brand/pashumitra_mark_xxx_black.svg" width="86" height="100" alt="Pashu Mitra mark, a shield with horns forming an M"><figcaption>mark · black</figcaption></figure>
+  </div>
+
+  <h2>Rules</h2>
+  <table>
+    <tr><th scope="col">Rule</th><th scope="col">Value</th></tr>
+    <tr><td>Header</td><td>Black lockup on white. Footer: white lockup on key colour <code>#0F5757</code>. No other colour variants.</td></tr>
+    <tr><td>Clear space</td><td>2 horn-stem widths (12 units, about 0.21 × mark height) on every side, enforced by <code>logo.js</code>.</td></tr>
+    <tr><td>Minimum size</td><td>Horizontal lockup 57 px high; mark only 30 px. Below the minimum the mark-only variant is used automatically.</td></tr>
+    <tr><td>Never</td><td>Stretch, condense, rotate, outline, hollow, add shadow, bevel, glow, gradient or texture; redraw; place on busy photography. Each logo file stays under 100 KB.</td></tr>
+    <tr><td>Co-branding</td><td>At most 2 co-brand logos in the header, supplied and authorised by their owners. Pashu Mitra stays left (horizontal) or on top (vertical).</td></tr>
+    <tr><td>Use in code</td><td><code>PMLogo.html({ variant, tone, lang, height, context })</code>. No style, class, filter or transform input exists.</td></tr>
+    <tr><td>File names</td><td><code>pashumitra_&lt;standard|alternate|mark&gt;_&lt;eng|hin|xxx&gt;_&lt;black|white&gt;.svg</code></td></tr>
+  </table>
+
+  <h2>Icons and social image</h2>
+  <div class="grid">
+    <figure class="tile"><img src="assets/brand/icon-192.png" width="96" height="96" alt="App icon"><figcaption>icon-192 / 512 (any)</figcaption></figure>
+    <figure class="tile"><img src="assets/brand/icon-maskable-192.png" width="96" height="96" alt="Maskable app icon"><figcaption>maskable (80% safe zone)</figcaption></figure>
+    <figure class="tile"><img src="assets/brand/social-1200x630.png" width="300" height="158" alt="Social sharing card, white lockup on dark green"><figcaption>social 1200×630</figcaption></figure>
+  </div>
+  <p class="note">Interim wordmark outlines use stand-in fonts. Regenerate with Noto Sans Bold (<code>scripts/build_logos.py</code>) before release. See <code>docs/brand/BRAND_GUIDELINES.md</code>.</p>
+</main>
+</body>
+</html>
